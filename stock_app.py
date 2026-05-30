@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import csv
 import shutil
 import sqlite3
-from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 
@@ -28,17 +28,6 @@ class InsufficientStockError(StockError):
     pass
 
 
-@dataclass(frozen=True)
-class Product:
-    codigo: str
-    nombre: str
-    precio: float
-    stock: int
-    stock_minimo: int
-    proveedor: str = ""
-    foto: str | None = None
-
-
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -56,14 +45,21 @@ def initialize_database(conn: sqlite3.Connection) -> None:
             stock INTEGER NOT NULL,
             stock_minimo INTEGER NOT NULL CHECK(stock_minimo >= 0),
             foto TEXT,
-            proveedor TEXT NOT NULL DEFAULT ''
+            proveedor TEXT NOT NULL DEFAULT '',
+            precio_costo REAL NOT NULL DEFAULT 0,
+            notas TEXT NOT NULL DEFAULT ''
         )
         """
     )
-    # migration: add proveedor to existing databases
+    # migrations for existing databases
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(productos)")}
-    if "proveedor" not in existing_cols:
-        conn.execute("ALTER TABLE productos ADD COLUMN proveedor TEXT NOT NULL DEFAULT ''")
+    for col, definition in [
+        ("proveedor", "TEXT NOT NULL DEFAULT ''"),
+        ("precio_costo", "REAL NOT NULL DEFAULT 0"),
+        ("notas", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE productos ADD COLUMN {col} {definition}")
 
     conn.execute(
         """
@@ -81,6 +77,20 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS caja (
             fecha TEXT PRIMARY KEY,
             total REAL NOT NULL DEFAULT 0 CHECK(total >= 0)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ventas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            cantidad INTEGER NOT NULL,
+            precio_unit REAL NOT NULL,
+            total REAL NOT NULL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL
         )
         """
     )
@@ -117,6 +127,8 @@ def add_product(
     stock_minimo: int,
     foto_path: str | None = None,
     proveedor: str = "",
+    precio_costo: float = 0.0,
+    notas: str = "",
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
@@ -127,10 +139,12 @@ def add_product(
     try:
         conn.execute(
             """
-            INSERT INTO productos (codigo, nombre, precio, stock, stock_minimo, foto, proveedor)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO productos
+                (codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (codigo, nombre, precio, stock, stock_minimo, foto, proveedor.strip()),
+            (codigo, nombre, precio, stock, stock_minimo, foto,
+             proveedor.strip(), precio_costo, notas.strip()),
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
@@ -146,6 +160,8 @@ def update_product(
     stock_minimo: int,
     foto_path: str | None = None,
     proveedor: str = "",
+    precio_costo: float = 0.0,
+    notas: str = "",
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
@@ -160,10 +176,12 @@ def update_product(
         conn.execute(
             """
             UPDATE productos
-            SET nombre = ?, precio = ?, stock = ?, stock_minimo = ?, foto = ?, proveedor = ?
+            SET nombre = ?, precio = ?, stock = ?, stock_minimo = ?,
+                foto = ?, proveedor = ?, precio_costo = ?, notas = ?
             WHERE codigo = ?
             """,
-            (nombre, precio, stock, stock_minimo, foto, proveedor.strip(), codigo),
+            (nombre, precio, stock, stock_minimo, foto,
+             proveedor.strip(), precio_costo, notas.strip(), codigo),
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
@@ -174,12 +192,14 @@ def _restore_product(conn: sqlite3.Connection, data: dict) -> None:
     """Re-inserts a previously deleted product row. Used by the undo system."""
     conn.execute(
         """
-        INSERT OR IGNORE INTO productos (codigo, nombre, precio, stock, stock_minimo, foto, proveedor)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO productos
+            (codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             data["codigo"], data["nombre"], data["precio"],
-            data["stock"], data["stock_minimo"], data["foto"], data["proveedor"],
+            data["stock"], data["stock_minimo"], data["foto"],
+            data["proveedor"], data.get("precio_costo", 0), data.get("notas", ""),
         ),
     )
     conn.commit()
@@ -197,7 +217,7 @@ def delete_product(conn: sqlite3.Connection, codigo: str) -> None:
 def list_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT codigo, nombre, precio, stock, stock_minimo, foto, proveedor
+        SELECT codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas
         FROM productos ORDER BY nombre
         """
     ).fetchall()
@@ -257,9 +277,10 @@ def register_sale(
         raise ValueError("La cantidad debe ser mayor a cero.")
 
     sale_day = (sale_date or date.today()).isoformat()
+    sale_hour = datetime.now().strftime("%H:%M:%S")
     with conn:
         product = conn.execute(
-            "SELECT codigo, precio, stock FROM productos WHERE codigo = ?", (codigo.strip(),)
+            "SELECT codigo, nombre, precio, stock FROM productos WHERE codigo = ?", (codigo.strip(),)
         ).fetchone()
         if product is None:
             raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
@@ -280,6 +301,14 @@ def register_sale(
             """,
             (sale_day, total),
         )
+        conn.execute(
+            """
+            INSERT INTO ventas (codigo, nombre, cantidad, precio_unit, total, fecha, hora)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
+             total, sale_day, sale_hour),
+        )
     return total
 
 
@@ -290,7 +319,7 @@ def reverse_sale(
     total: float,
     sale_date: str,
 ) -> None:
-    """Reverts a registered sale: restores stock and subtracts total from daily cash."""
+    """Reverts a registered sale: restores stock, subtracts total from daily cash, removes venta row."""
     with conn:
         conn.execute(
             "UPDATE productos SET stock = stock + ? WHERE codigo = ?",
@@ -299,6 +328,16 @@ def reverse_sale(
         conn.execute(
             "UPDATE caja SET total = MAX(0, total - ?) WHERE fecha = ?",
             (total, sale_date),
+        )
+        conn.execute(
+            """
+            DELETE FROM ventas WHERE id = (
+                SELECT id FROM ventas
+                WHERE codigo = ? AND total = ? AND fecha = ?
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (codigo.strip(), total, sale_date),
         )
 
 
@@ -331,6 +370,70 @@ def daily_cash(conn: sqlite3.Connection, cash_date: date | None = None) -> float
     day = (cash_date or date.today()).isoformat()
     row = conn.execute("SELECT total FROM caja WHERE fecha = ?", (day,)).fetchone()
     return float(row["total"]) if row else 0.0
+
+
+def get_ventas_hoy(conn: sqlite3.Connection, cash_date: date | None = None) -> list[sqlite3.Row]:
+    day = (cash_date or date.today()).isoformat()
+    return conn.execute(
+        """
+        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total
+        FROM ventas WHERE fecha = ? ORDER BY id DESC
+        """,
+        (day,),
+    ).fetchall()
+
+
+def get_daily_summary(conn: sqlite3.Connection, cash_date: date | None = None) -> dict:
+    day = (cash_date or date.today()).isoformat()
+    total = daily_cash(conn, cash_date)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM ventas WHERE fecha = ?", (day,)
+    ).fetchone()[0]
+    top = conn.execute(
+        """
+        SELECT nombre, SUM(cantidad) AS total_cant, SUM(total) AS total_monto
+        FROM ventas WHERE fecha = ?
+        GROUP BY codigo ORDER BY total_monto DESC LIMIT 5
+        """,
+        (day,),
+    ).fetchall()
+    return {"fecha": day, "total": total, "count": count, "top_products": top}
+
+
+def backup_database() -> Path | None:
+    """Creates one backup per day in backups/. Returns None if today's backup already exists."""
+    backups_dir = BASE_DIR / "backups"
+    backups_dir.mkdir(exist_ok=True)
+    today = date.today().strftime("%Y%m%d")
+    if list(backups_dir.glob(f"stock_{today}_*.db")):
+        return None
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = backups_dir / f"stock_{ts}.db"
+    shutil.copy2(DB_PATH, dest)
+    return dest
+
+
+def export_products_csv(conn: sqlite3.Connection, dest_path: Path) -> int:
+    rows = list_products(conn)
+    fieldnames = ["codigo", "nombre", "precio", "precio_costo", "stock",
+                  "stock_minimo", "proveedor", "notas"]
+    with open(dest_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row[k] for k in fieldnames})
+    return len(rows)
+
+
+def export_ventas_csv(conn: sqlite3.Connection, dest_path: Path, cash_date: date | None = None) -> int:
+    rows = get_ventas_hoy(conn, cash_date)
+    with open(dest_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Hora", "Codigo", "Nombre", "Cantidad", "Precio Unit.", "Total"])
+        for row in rows:
+            writer.writerow([row["hora"], row["codigo"], row["nombre"],
+                             row["cantidad"], row["precio_unit"], row["total"]])
+    return len(rows)
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────────
@@ -366,6 +469,7 @@ def print_products(rows: list[sqlite3.Row]) -> None:
     for row in rows:
         print(
             f"{row['codigo']} | {row['nombre']} | ${row['precio']:.2f} | "
+            f"costo ${row['precio_costo']:.2f} | "
             f"stock {row['stock']} | minimo {row['stock_minimo']} | "
             f"proveedor {row['proveedor'] or '-'} | foto {row['foto'] or '-'}"
         )
@@ -374,13 +478,16 @@ def print_products(rows: list[sqlite3.Row]) -> None:
 def create_product_flow(conn: sqlite3.Connection) -> None:
     codigo = read_text("Codigo de barras: ")
     nombre = read_text("Nombre: ")
-    precio = read_float("Precio: ")
+    precio = read_float("Precio de venta: ")
+    precio_costo = read_float("Precio de costo (0 si no aplica): ")
     stock = read_int("Stock inicial: ")
     stock_minimo = read_int("Stock minimo: ")
     proveedor = read_text("Proveedor (opcional): ", required=False)
+    notas = read_text("Notas (opcional): ", required=False)
     foto_path = read_text("Ruta de foto (opcional): ", required=False)
     try:
-        add_product(conn, codigo, nombre, precio, stock, stock_minimo, foto_path, proveedor)
+        add_product(conn, codigo, nombre, precio, stock, stock_minimo,
+                    foto_path, proveedor, precio_costo, notas)
         print("Producto registrado.")
     except DuplicateProductError as exc:
         print(exc)
@@ -453,7 +560,8 @@ def main() -> None:
             print("3. Venta rapida")
             print("4. Alertas de stock bajo")
             print("5. Caja del dia")
-            print("6. Pendientes")
+            print("6. Ventas de hoy")
+            print("7. Pendientes")
             print("0. Salir")
             option = input("Opcion: ").strip()
 
@@ -468,6 +576,12 @@ def main() -> None:
             elif option == "5":
                 print(f"Caja de hoy: ${daily_cash(conn):.2f}")
             elif option == "6":
+                rows = get_ventas_hoy(conn)
+                if not rows:
+                    print("Sin ventas registradas hoy.")
+                for row in rows:
+                    print(f"{row['hora']} | {row['nombre']} | x{row['cantidad']} | ${row['total']:.2f}")
+            elif option == "7":
                 pending_menu(conn)
             elif option == "0":
                 print("Sistema cerrado.")

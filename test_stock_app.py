@@ -52,6 +52,21 @@ class StockAppTests(unittest.TestCase):
         product = stock_app.get_product(self.conn, "P02")
         self.assertEqual(product["proveedor"], "")
 
+    def test_add_product_stores_precio_costo_and_notas(self):
+        stock_app.add_product(
+            self.conn, "PC01", "Café", 1200, 5, 1,
+            precio_costo=800.0, notas="Mantener en lugar fresco"
+        )
+        product = stock_app.get_product(self.conn, "PC01")
+        self.assertEqual(product["precio_costo"], 800.0)
+        self.assertEqual(product["notas"], "Mantener en lugar fresco")
+
+    def test_add_product_precio_costo_defaults_to_zero(self):
+        stock_app.add_product(self.conn, "PC02", "Pan", 300, 10, 2)
+        product = stock_app.get_product(self.conn, "PC02")
+        self.assertEqual(product["precio_costo"], 0.0)
+        self.assertEqual(product["notas"], "")
+
     # ── input helpers ─────────────────────────────────────────────────────────
 
     def test_invalid_price_input_retries_until_valid_number(self):
@@ -79,6 +94,17 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(product["stock"], 3)
         self.assertEqual(cash["total"], 2000)
 
+    def test_sale_creates_venta_record(self):
+        stock_app.add_product(self.conn, "VR01", "Leche", 500, 10, 1)
+        stock_app.register_sale(self.conn, "VR01", 3, sale_date=date(2026, 5, 23))
+        ventas = self.conn.execute(
+            "SELECT * FROM ventas WHERE codigo = 'VR01'"
+        ).fetchall()
+        self.assertEqual(len(ventas), 1)
+        self.assertEqual(ventas[0]["cantidad"], 3)
+        self.assertEqual(ventas[0]["total"], 1500.0)
+        self.assertEqual(ventas[0]["fecha"], "2026-05-23")
+
     def test_sale_without_stock_requires_authorization(self):
         stock_app.add_product(self.conn, "779004", "Aceite", 3000, 1, 1)
         with self.assertRaises(stock_app.InsufficientStockError):
@@ -101,6 +127,16 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(product["stock"], 10)
         self.assertEqual(cash["total"], 0.0)
 
+    def test_reverse_sale_deletes_venta_record(self):
+        stock_app.add_product(self.conn, "REV03", "Queso", 800, 5, 1)
+        stock_app.register_sale(self.conn, "REV03", 2, sale_date=date(2026, 5, 5))
+        total = 1600.0
+        stock_app.reverse_sale(self.conn, "REV03", 2, total, "2026-05-05")
+        ventas = self.conn.execute(
+            "SELECT * FROM ventas WHERE codigo = 'REV03'"
+        ).fetchall()
+        self.assertEqual(ventas, [])
+
     def test_reverse_sale_caja_does_not_go_negative(self):
         stock_app.add_product(self.conn, "REV02", "Fideo", 500, 5, 1)
         stock_app.register_sale(self.conn, "REV02", 1, sale_date=date(2026, 5, 2))
@@ -110,6 +146,32 @@ class StockAppTests(unittest.TestCase):
             "SELECT total FROM caja WHERE fecha = '2026-05-02'"
         ).fetchone()
         self.assertEqual(cash["total"], 0.0)
+
+    # ── get_ventas_hoy / get_daily_summary ────────────────────────────────────
+
+    def test_get_ventas_hoy_returns_todays_sales(self):
+        stock_app.add_product(self.conn, "GVH01", "Aceite", 1000, 5, 0)
+        stock_app.add_product(self.conn, "GVH02", "Sal", 200, 10, 0)
+        today = date.today()
+        stock_app.register_sale(self.conn, "GVH01", 2, sale_date=today)
+        stock_app.register_sale(self.conn, "GVH02", 1, sale_date=today)
+        ventas = stock_app.get_ventas_hoy(self.conn)
+        self.assertEqual(len(ventas), 2)
+
+    def test_get_ventas_hoy_excludes_other_dates(self):
+        stock_app.add_product(self.conn, "GVH03", "Pan", 300, 5, 0)
+        stock_app.register_sale(self.conn, "GVH03", 1, sale_date=date(2025, 1, 1))
+        ventas = stock_app.get_ventas_hoy(self.conn)
+        self.assertEqual(ventas, [])
+
+    def test_get_daily_summary_totals(self):
+        stock_app.add_product(self.conn, "GDS01", "Café", 500, 5, 0)
+        today = date.today()
+        stock_app.register_sale(self.conn, "GDS01", 2, sale_date=today)
+        stock_app.register_sale(self.conn, "GDS01", 1, sale_date=today)
+        summary = stock_app.get_daily_summary(self.conn)
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["total"], 1500.0)
 
     # ── low stock ─────────────────────────────────────────────────────────────
 
@@ -131,13 +193,18 @@ class StockAppTests(unittest.TestCase):
 
     def test_update_product_changes_fields(self):
         stock_app.add_product(self.conn, "UP001", "Original", 1000, 5, 1)
-        stock_app.update_product(self.conn, "UP001", "Actualizado", 1500, 10, 2, proveedor="ProvX")
+        stock_app.update_product(
+            self.conn, "UP001", "Actualizado", 1500, 10, 2,
+            proveedor="ProvX", precio_costo=900.0, notas="Nueva nota"
+        )
         product = stock_app.get_product(self.conn, "UP001")
         self.assertEqual(product["nombre"], "Actualizado")
         self.assertEqual(product["precio"], 1500)
         self.assertEqual(product["stock"], 10)
         self.assertEqual(product["stock_minimo"], 2)
         self.assertEqual(product["proveedor"], "ProvX")
+        self.assertEqual(product["precio_costo"], 900.0)
+        self.assertEqual(product["notas"], "Nueva nota")
 
     def test_update_preserves_foto_when_no_new_path(self):
         stock_app.add_product(self.conn, "UP002", "Sin foto", 100, 1, 0)
@@ -170,7 +237,10 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(rows[0]["codigo"], "KEEP")
 
     def test_restore_product_reinserts_row(self):
-        stock_app.add_product(self.conn, "REST01", "Restoreable", 300, 2, 0, proveedor="Prov")
+        stock_app.add_product(
+            self.conn, "REST01", "Restoreable", 300, 2, 0,
+            proveedor="Prov", precio_costo=150.0, notas="Nota"
+        )
         product = stock_app.get_product(self.conn, "REST01")
         data = {k: product[k] for k in product.keys()}
         stock_app.delete_product(self.conn, "REST01")
@@ -178,6 +248,8 @@ class StockAppTests(unittest.TestCase):
         restored = stock_app.get_product(self.conn, "REST01")
         self.assertEqual(restored["nombre"], "Restoreable")
         self.assertEqual(restored["proveedor"], "Prov")
+        self.assertEqual(restored["precio_costo"], 150.0)
+        self.assertEqual(restored["notas"], "Nota")
 
     # ── bulk_price_increase ───────────────────────────────────────────────────
 
@@ -238,6 +310,46 @@ class StockAppTests(unittest.TestCase):
 
     def test_delete_pending_nonexistent_returns_false(self):
         self.assertFalse(stock_app.delete_pending(self.conn, 9999))
+
+    # ── backup_database ───────────────────────────────────────────────────────
+
+    def test_backup_database_creates_file(self):
+        with patch.object(stock_app, "BASE_DIR", Path(self.tmp.name)), \
+             patch.object(stock_app, "DB_PATH", self.db_path):
+            result = stock_app.backup_database()
+        self.assertIsNotNone(result)
+        self.assertTrue(result.exists())
+        self.assertTrue(result.name.startswith("stock_"))
+
+    def test_backup_database_skips_if_already_done_today(self):
+        with patch.object(stock_app, "BASE_DIR", Path(self.tmp.name)), \
+             patch.object(stock_app, "DB_PATH", self.db_path):
+            first = stock_app.backup_database()
+            second = stock_app.backup_database()
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    # ── export CSV ────────────────────────────────────────────────────────────
+
+    def test_export_products_csv_creates_file(self):
+        stock_app.add_product(self.conn, "EXP01", "Exportable", 100, 5, 1)
+        dest = Path(self.tmp.name) / "productos.csv"
+        n = stock_app.export_products_csv(self.conn, dest)
+        self.assertEqual(n, 1)
+        self.assertTrue(dest.exists())
+        content = dest.read_text(encoding="utf-8-sig")
+        self.assertIn("EXP01", content)
+        self.assertIn("Exportable", content)
+
+    def test_export_ventas_csv_creates_file(self):
+        stock_app.add_product(self.conn, "EXV01", "Vendible", 500, 10, 0)
+        today = date.today()
+        stock_app.register_sale(self.conn, "EXV01", 2, sale_date=today)
+        dest = Path(self.tmp.name) / "ventas.csv"
+        n = stock_app.export_ventas_csv(self.conn, dest)
+        self.assertEqual(n, 1)
+        content = dest.read_text(encoding="utf-8-sig")
+        self.assertIn("EXV01", content)
 
 
 # =============================================================================
@@ -316,9 +428,15 @@ class StockGuiTests(unittest.TestCase):
     def test_initial_edit_mode_is_false(self):
         self.assertFalse(self.app._edit_mode)
         self.assertIsNone(self.app._edit_codigo)
+        self.assertFalse(self.app._form_visible)
+        self.assertFalse(self.app._product_form_frame.winfo_ismapped())
 
     def test_undo_button_starts_disabled(self):
         self.assertEqual(str(self.app._undo_btn.cget("state")), "disabled")
+
+    def test_cart_mode_starts_inactive(self):
+        self.assertFalse(self.app._cart_mode_active)
+        self.assertEqual(self.app._cart, [])
 
     # ── create product ────────────────────────────────────────────────────────
 
@@ -326,15 +444,18 @@ class StockGuiTests(unittest.TestCase):
         self.app.codigo_var.set("GUI001")
         self.app.nombre_var.set("Producto GUI")
         self.app.precio_var.set("250")
+        self.app.precio_costo_var.set("150")
         self.app.stock_var.set("10")
         self.app.stock_minimo_var.set("2")
         self.app.proveedor_var.set("Prov Test")
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app.save_product()
+        self.app.notas_var.set("Nota de prueba")
+        self.app.save_product()
         rows = stock_app.list_products(self.app.conn)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["codigo"], "GUI001")
         self.assertEqual(rows[0]["proveedor"], "Prov Test")
+        self.assertEqual(rows[0]["precio_costo"], 150.0)
+        self.assertEqual(rows[0]["notas"], "Nota de prueba")
 
     def test_create_product_clears_form_on_success(self):
         self.app.codigo_var.set("GUI002")
@@ -342,23 +463,30 @@ class StockGuiTests(unittest.TestCase):
         self.app.precio_var.set("100")
         self.app.stock_var.set("5")
         self.app.stock_minimo_var.set("1")
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app.save_product()
+        self.app.precio_costo_var.set("60")
+        self.app.save_product()
         self.assertEqual(self.app.codigo_var.get(), "")
         self.assertEqual(self.app.nombre_var.get(), "")
         self.assertEqual(self.app.proveedor_var.get(), "")
+        self.assertEqual(self.app.precio_costo_var.get(), "")
+        self.assertEqual(self.app.notas_var.get(), "")
 
     # ── edit mode ─────────────────────────────────────────────────────────────
 
     def test_enter_edit_mode_populates_form(self):
-        stock_app.add_product(self.test_conn, "ED001", "Editable", 500, 8, 2, proveedor="ProvX")
+        stock_app.add_product(
+            self.test_conn, "ED001", "Editable", 500, 8, 2,
+            proveedor="ProvX", precio_costo=300.0, notas="Fragil"
+        )
         product = stock_app.get_product(self.test_conn, "ED001")
         self.app.enter_edit_mode(product)
         self.assertTrue(self.app._edit_mode)
+        self.assertTrue(self.app._form_visible)
         self.assertEqual(self.app._edit_codigo, "ED001")
         self.assertEqual(self.app.codigo_var.get(), "ED001")
         self.assertEqual(self.app.nombre_var.get(), "Editable")
         self.assertEqual(self.app.proveedor_var.get(), "ProvX")
+        self.assertEqual(self.app.notas_var.get(), "Fragil")
         self.assertEqual(self.app._save_btn.cget("text"), "Actualizar")
 
     def test_cancel_edit_resets_to_create_mode(self):
@@ -370,6 +498,7 @@ class StockGuiTests(unittest.TestCase):
         self.assertIsNone(self.app._edit_codigo)
         self.assertEqual(self.app.codigo_var.get(), "")
         self.assertEqual(self.app._save_btn.cget("text"), "Guardar")
+        self.assertTrue(self.app._form_visible)
 
     def test_update_product_via_gui(self):
         stock_app.add_product(self.test_conn, "UP_GUI", "Antes", 100, 5, 1)
@@ -377,11 +506,12 @@ class StockGuiTests(unittest.TestCase):
         self.app.enter_edit_mode(product)
         self.app.nombre_var.set("Despues")
         self.app.precio_var.set("200")
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app.save_product()
+        self.app.precio_costo_var.set("120")
+        self.app.save_product()
         updated = stock_app.get_product(self.test_conn, "UP_GUI")
         self.assertEqual(updated["nombre"], "Despues")
         self.assertEqual(updated["precio"], 200.0)
+        self.assertEqual(updated["precio_costo"], 120.0)
         self.assertFalse(self.app._edit_mode)
 
     # ── undo ──────────────────────────────────────────────────────────────────
@@ -394,8 +524,7 @@ class StockGuiTests(unittest.TestCase):
         with patch.object(stock_gui.messagebox, "askyesno", return_value=True):
             self.app.delete_selected_product()
         self.assertEqual(stock_app.list_products(self.test_conn), [])
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app._undo()
+        self.app._undo()
         rows = stock_app.list_products(self.test_conn)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["nombre"], "Undo Test")
@@ -404,12 +533,10 @@ class StockGuiTests(unittest.TestCase):
         stock_app.add_product(self.test_conn, "SALE01", "Venta Undo", 1000, 5, 0)
         self.app.venta_codigo_var.set("SALE01")
         self.app.venta_cantidad_var.set("2")
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app.register_sale()
+        self.app.register_sale()
         product_after = stock_app.get_product(self.test_conn, "SALE01")
         self.assertEqual(product_after["stock"], 3)
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app._undo()
+        self.app._undo()
         product_restored = stock_app.get_product(self.test_conn, "SALE01")
         self.assertEqual(product_restored["stock"], 5)
 
@@ -419,15 +546,52 @@ class StockGuiTests(unittest.TestCase):
         iid = self.app.price_table.get_children()[0]
         self.app.price_table.selection_set(iid)
         self.app.aumento_var.set("10")
-        with patch.object(stock_gui.messagebox, "askyesno", return_value=True), \
-             patch.object(stock_gui.messagebox, "showinfo"):
+        with patch.object(stock_gui.messagebox, "askyesno", return_value=True):
             self.app._apply_to_selected()
         product_increased = stock_app.get_product(self.test_conn, "PRICE01")
         self.assertEqual(product_increased["precio"], 1100.0)
-        with patch.object(stock_gui.messagebox, "showinfo"):
-            self.app._undo()
+        self.app._undo()
         product_original = stock_app.get_product(self.test_conn, "PRICE01")
         self.assertEqual(product_original["precio"], 1000.0)
+
+    # ── cart mode ─────────────────────────────────────────────────────────────
+
+    def test_toggle_cart_mode_activates(self):
+        self.app._toggle_cart_mode()
+        self.assertTrue(self.app._cart_mode_active)
+
+    def test_add_to_cart_accumulates_items(self):
+        stock_app.add_product(self.test_conn, "CART01", "Producto Carrito", 500, 10, 0)
+        self.app._toggle_cart_mode()
+        self.app.venta_codigo_var.set("CART01")
+        self.app.venta_cantidad_var.set("3")
+        self.app._add_to_cart()
+        self.assertEqual(len(self.app._cart), 1)
+        self.assertEqual(self.app._cart[0]["cantidad"], 3)
+        self.assertEqual(self.app._cart[0]["subtotal"], 1500.0)
+
+    def test_add_to_cart_merges_same_product(self):
+        stock_app.add_product(self.test_conn, "CART02", "Mergeble", 200, 10, 0)
+        self.app._toggle_cart_mode()
+        self.app.venta_codigo_var.set("CART02")
+        self.app.venta_cantidad_var.set("2")
+        self.app._add_to_cart()
+        self.app.venta_codigo_var.set("CART02")
+        self.app.venta_cantidad_var.set("3")
+        self.app._add_to_cart()
+        self.assertEqual(len(self.app._cart), 1)
+        self.assertEqual(self.app._cart[0]["cantidad"], 5)
+
+    def test_cobrar_carrito_registers_sales(self):
+        stock_app.add_product(self.test_conn, "CART03", "Cobrable", 300, 5, 0)
+        self.app._toggle_cart_mode()
+        self.app.venta_codigo_var.set("CART03")
+        self.app.venta_cantidad_var.set("2")
+        self.app._add_to_cart()
+        self.app._cobrar_carrito()
+        product = stock_app.get_product(self.test_conn, "CART03")
+        self.assertEqual(product["stock"], 3)
+        self.assertEqual(self.app._cart, [])
 
     # ── search ────────────────────────────────────────────────────────────────
 
@@ -453,6 +617,17 @@ class StockGuiTests(unittest.TestCase):
             for iid in self.app.price_table.get_children()
         ]
         self.assertEqual(visible, ["Cola"])
+
+    def test_price_table_shows_margen(self):
+        stock_app.add_product(
+            self.test_conn, "MAR01", "Con margen", 1000, 5, 0, precio_costo=600.0
+        )
+        self.app.refresh_price_table()
+        iid = self.app.price_table.get_children()[0]
+        values = self.app.price_table.item(iid, "values")
+        margen_col = values[4]  # "margen" is col index 4
+        self.assertIn("%", margen_col)
+        self.assertNotEqual(margen_col, "-")
 
     # ── pending ───────────────────────────────────────────────────────────────
 
