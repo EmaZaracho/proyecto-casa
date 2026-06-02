@@ -2,4 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 stock.db
+stock.log
 fotos_productos/
+backups/
+config.json

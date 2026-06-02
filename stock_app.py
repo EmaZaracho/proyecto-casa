@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import json
+import logging
 import shutil
 import sqlite3
 from datetime import date, datetime
@@ -10,6 +12,28 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "stock.db"
 PHOTOS_DIR = BASE_DIR / "fotos_productos"
+CONFIG_PATH = BASE_DIR / "config.json"
+
+_DEFAULT_CONFIG: dict = {
+    "nombre_negocio": "Sistema de Stock",
+    "moneda": "$",
+}
+
+logger = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return {**_DEFAULT_CONFIG, **data}
+        except Exception:
+            pass
+    return dict(_DEFAULT_CONFIG)
+
+
+def save_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 class StockError(Exception):
@@ -34,8 +58,24 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+_SCHEMA_VERSION = 2
+
+
 def initialize_database(conn: sqlite3.Connection) -> None:
     PHOTOS_DIR.mkdir(exist_ok=True)
+
+    # schema_version table — must be first so migrations can reference it
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL
+        )
+        """
+    )
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    current_version = int(row["version"]) if row else 0
+
+    # ── base tables (idempotent) ───────────────────────────────────────────────
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS productos (
@@ -51,16 +91,6 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # migrations for existing databases
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(productos)")}
-    for col, definition in [
-        ("proveedor", "TEXT NOT NULL DEFAULT ''"),
-        ("precio_costo", "REAL NOT NULL DEFAULT 0"),
-        ("notas", "TEXT NOT NULL DEFAULT ''"),
-    ]:
-        if col not in existing_cols:
-            conn.execute(f"ALTER TABLE productos ADD COLUMN {col} {definition}")
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS pendientes (
@@ -94,6 +124,46 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS historial_precios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            precio_anterior REAL NOT NULL,
+            precio_nuevo REAL NOT NULL,
+            fecha TEXT NOT NULL,
+            motivo TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+    # ── versioned migrations ───────────────────────────────────────────────────
+    def _col_exists(table: str, col: str) -> bool:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        return col in cols
+
+    # v0 → v1: add extra columns to productos (legacy migration kept as-is)
+    if current_version < 1:
+        for col, definition in [
+            ("proveedor", "TEXT NOT NULL DEFAULT ''"),
+            ("precio_costo", "REAL NOT NULL DEFAULT 0"),
+            ("notas", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if not _col_exists("productos", col):
+                conn.execute(f"ALTER TABLE productos ADD COLUMN {col} {definition}")
+
+    # v1 → v2: add forma_pago to ventas
+    if current_version < 2:
+        if not _col_exists("ventas", "forma_pago"):
+            conn.execute("ALTER TABLE ventas ADD COLUMN forma_pago TEXT NOT NULL DEFAULT 'Efectivo'")
+
+    # update stored version
+    if current_version == 0:
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+    elif current_version < _SCHEMA_VERSION:
+        conn.execute("UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,))
+
     conn.commit()
 
 
@@ -165,7 +235,7 @@ def update_product(
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
-    row = conn.execute("SELECT foto FROM productos WHERE codigo = ?", (codigo,)).fetchone()
+    row = conn.execute("SELECT foto, precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
     if row is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
 
@@ -183,6 +253,8 @@ def update_product(
             (nombre, precio, stock, stock_minimo, foto,
              proveedor.strip(), precio_costo, notas.strip(), codigo),
         )
+        if float(row["precio"]) != precio:
+            log_price_change(conn, codigo, nombre, float(row["precio"]), precio, "Edición manual")
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise StockError(f"No se pudo actualizar el producto: {exc}") from exc
@@ -248,6 +320,30 @@ def low_stock_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def log_price_change(
+    conn: sqlite3.Connection,
+    codigo: str,
+    nombre: str,
+    precio_anterior: float,
+    precio_nuevo: float,
+    motivo: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO historial_precios (codigo, nombre, precio_anterior, precio_nuevo, fecha, motivo)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (codigo, nombre, float(precio_anterior), float(precio_nuevo),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), motivo),
+    )
+
+
+def get_price_history(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM historial_precios ORDER BY id DESC"
+    ).fetchall()
+
+
 def bulk_price_increase(
     conn: sqlite3.Connection,
     codigos: list[str],
@@ -256,11 +352,12 @@ def bulk_price_increase(
     """Applies pct% increase rounded to the nearest ten. Returns (codigo, old, new) per product."""
     changes: list[tuple[str, float, float]] = []
     for codigo in codigos:
-        row = conn.execute("SELECT precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
+        row = conn.execute("SELECT precio, nombre FROM productos WHERE codigo = ?", (codigo,)).fetchone()
         if row:
             old_price = float(row["precio"])
             new_price = round(old_price * (1 + pct / 100) / 10) * 10
             conn.execute("UPDATE productos SET precio = ? WHERE codigo = ?", (new_price, codigo))
+            log_price_change(conn, codigo, row["nombre"], old_price, new_price, f"Aumento masivo {pct}%")
             changes.append((codigo, old_price, new_price))
     conn.commit()
     return changes
@@ -272,6 +369,7 @@ def register_sale(
     cantidad: int,
     allow_negative: bool = False,
     sale_date: date | None = None,
+    forma_pago: str = "Efectivo",
 ) -> float:
     if cantidad <= 0:
         raise ValueError("La cantidad debe ser mayor a cero.")
@@ -303,11 +401,11 @@ def register_sale(
         )
         conn.execute(
             """
-            INSERT INTO ventas (codigo, nombre, cantidad, precio_unit, total, fecha, hora)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO ventas (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
-             total, sale_day, sale_hour),
+             total, sale_day, sale_hour, forma_pago),
         )
     return total
 
@@ -376,8 +474,20 @@ def get_ventas_hoy(conn: sqlite3.Connection, cash_date: date | None = None) -> l
     day = (cash_date or date.today()).isoformat()
     return conn.execute(
         """
-        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total
+        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total, forma_pago
         FROM ventas WHERE fecha = ? ORDER BY id DESC
+        """,
+        (day,),
+    ).fetchall()
+
+
+def get_payment_breakdown(conn: sqlite3.Connection, cash_date: date | None = None) -> list[sqlite3.Row]:
+    day = (cash_date or date.today()).isoformat()
+    return conn.execute(
+        """
+        SELECT forma_pago, COUNT(*) AS cantidad, SUM(total) AS total
+        FROM ventas WHERE fecha = ?
+        GROUP BY forma_pago ORDER BY total DESC
         """,
         (day,),
     ).fetchall()
