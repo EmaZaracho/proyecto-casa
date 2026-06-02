@@ -94,6 +94,19 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS historial_precios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            precio_anterior REAL NOT NULL,
+            precio_nuevo REAL NOT NULL,
+            fecha TEXT NOT NULL,
+            motivo TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
     conn.commit()
 
 
@@ -165,7 +178,7 @@ def update_product(
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
-    row = conn.execute("SELECT foto FROM productos WHERE codigo = ?", (codigo,)).fetchone()
+    row = conn.execute("SELECT foto, precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
     if row is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
 
@@ -183,6 +196,8 @@ def update_product(
             (nombre, precio, stock, stock_minimo, foto,
              proveedor.strip(), precio_costo, notas.strip(), codigo),
         )
+        if float(row["precio"]) != precio:
+            log_price_change(conn, codigo, nombre, float(row["precio"]), precio, "Edición manual")
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise StockError(f"No se pudo actualizar el producto: {exc}") from exc
@@ -248,6 +263,30 @@ def low_stock_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def log_price_change(
+    conn: sqlite3.Connection,
+    codigo: str,
+    nombre: str,
+    precio_anterior: float,
+    precio_nuevo: float,
+    motivo: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO historial_precios (codigo, nombre, precio_anterior, precio_nuevo, fecha, motivo)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (codigo, nombre, float(precio_anterior), float(precio_nuevo),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), motivo),
+    )
+
+
+def get_price_history(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM historial_precios ORDER BY id DESC"
+    ).fetchall()
+
+
 def bulk_price_increase(
     conn: sqlite3.Connection,
     codigos: list[str],
@@ -256,11 +295,12 @@ def bulk_price_increase(
     """Applies pct% increase rounded to the nearest ten. Returns (codigo, old, new) per product."""
     changes: list[tuple[str, float, float]] = []
     for codigo in codigos:
-        row = conn.execute("SELECT precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
+        row = conn.execute("SELECT precio, nombre FROM productos WHERE codigo = ?", (codigo,)).fetchone()
         if row:
             old_price = float(row["precio"])
             new_price = round(old_price * (1 + pct / 100) / 10) * 10
             conn.execute("UPDATE productos SET precio = ? WHERE codigo = ?", (new_price, codigo))
+            log_price_change(conn, codigo, row["nombre"], old_price, new_price, f"Aumento masivo {pct}%")
             changes.append((codigo, old_price, new_price))
     conn.commit()
     return changes

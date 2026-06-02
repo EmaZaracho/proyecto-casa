@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -51,6 +51,9 @@ class StockGui(tk.Tk):
         self.aumento_var = tk.StringVar()
         self._price_status_var = tk.StringVar(value="Seleccionados: 0")
 
+        # ── historial tab vars ──
+        self._hist_search_var = tk.StringVar()
+
         # ── state ──
         self._edit_mode = False
         self._edit_codigo: str | None = None
@@ -61,6 +64,7 @@ class StockGui(tk.Tk):
 
         self._build_layout()
         self.search_var.trace_add("write", lambda *_: self.refresh_products())
+        self._hist_search_var.trace_add("write", lambda *_: self._refresh_price_history())
         self.refresh_all()
         self.bind("<Control-z>", lambda _: self._undo())
         # F-key shortcuts
@@ -112,13 +116,16 @@ class StockGui(tk.Tk):
         tab1 = ttk.Frame(self._notebook, padding=6)
         tab2 = ttk.Frame(self._notebook, padding=6)
         tab3 = ttk.Frame(self._notebook, padding=6)
+        tab4 = ttk.Frame(self._notebook, padding=6)
         self._notebook.add(tab1, text="  Principal  ")
         self._notebook.add(tab2, text="  Gestión de precios  ")
         self._notebook.add(tab3, text="  Ventas del día  ")
+        self._notebook.add(tab4, text="  Historial de precios  ")
 
         self._build_tab_principal(tab1)
         self._build_tab_precios(tab2)
         self._build_tab_ventas(tab3)
+        self._build_tab_historial(tab4)
 
         status_bar = ttk.Label(
             outer, textvariable=self._status_var,
@@ -154,6 +161,7 @@ class StockGui(tk.Tk):
         self._build_product_form(left)
         self._build_product_table(left)
         self._build_sale_box(right)
+        self._toggle_cart_mode()  # arranca en modo carrito
         self._build_alerts_box(right)
         self._build_pending_box(right)
 
@@ -483,7 +491,68 @@ class StockGui(tk.Tk):
             inc_frame, text="Exportar productos CSV",
             command=self._export_products_csv,
         ).grid(row=0, column=5, padx=(0, 8))
-        ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=6, sticky="e")
+        ttk.Button(
+            inc_frame, text="Exportar PDF",
+            command=self._export_pdf,
+        ).grid(row=0, column=6, padx=(0, 8))
+        ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=7, sticky="e")
+
+    # ── Tab 4: price history ──────────────────────────────────────────────────
+
+    def _build_tab_historial(self, parent: ttk.Frame) -> None:
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(1, weight=1)
+        ttk.Label(filter_row, text="Buscar:").grid(row=0, column=0, padx=(0, 6))
+        ttk.Entry(filter_row, textvariable=self._hist_search_var).grid(row=0, column=1, sticky="ew")
+        ttk.Button(filter_row, text="Refrescar", command=self._refresh_price_history).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+
+        table_frame = ttk.LabelFrame(parent, text="Cambios de precio", padding=8)
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        hist_cols = ("fecha", "codigo", "nombre", "anterior", "nuevo", "cambio", "motivo")
+        self._hist_table = ttk.Treeview(table_frame, columns=hist_cols, show="headings", height=20)
+        for col, label, width in (
+            ("fecha", "Fecha y hora", 140),
+            ("codigo", "Codigo", 80),
+            ("nombre", "Nombre", 150),
+            ("anterior", "Precio ant.", 80),
+            ("nuevo", "Precio nuevo", 85),
+            ("cambio", "Cambio", 70),
+            ("motivo", "Motivo", 160),
+        ):
+            self._hist_table.heading(col, text=label)
+            self._hist_table.column(col, width=width, minwidth=40)
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self._hist_table.yview)
+        self._hist_table.configure(yscrollcommand=vsb.set)
+        self._hist_table.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+    def _refresh_price_history(self) -> None:
+        clear_table(self._hist_table)
+        query = self._hist_search_var.get().lower()
+        for row in stock_app.get_price_history(self.conn):
+            if query and query not in row["codigo"].lower() and query not in row["nombre"].lower():
+                continue
+            ant = float(row["precio_anterior"])
+            nvo = float(row["precio_nuevo"])
+            if ant > 0:
+                pct = ((nvo - ant) / ant) * 100
+                cambio = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
+            else:
+                cambio = "-"
+            self._hist_table.insert("", "end", values=(
+                row["fecha"], row["codigo"], row["nombre"],
+                f"${ant:.2f}", f"${nvo:.2f}", cambio, row["motivo"],
+            ))
 
     # ── Tab 3: sales of the day ───────────────────────────────────────────────
 
@@ -565,6 +634,8 @@ class StockGui(tk.Tk):
             self.refresh_price_table()
         elif idx == 2:
             self.refresh_ventas()
+        elif idx == 3:
+            self._refresh_price_history()
 
     # =========================================================================
     # Proveedor autocomplete
@@ -897,6 +968,98 @@ class StockGui(tk.Tk):
         n = stock_app.export_products_csv(self.conn, Path(filepath))
         self._set_status(f"✓ Exportados {n} productos a {Path(filepath).name}")
 
+    def _export_pdf(self) -> None:
+        try:
+            from fpdf import FPDF  # type: ignore
+        except ImportError:
+            messagebox.showerror("Error", "Falta la librería fpdf2.\nEjecutá: pip install fpdf2")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Exportar PDF")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="¿Qué incluir en el PDF?", font=("Segoe UI", 10, "bold")).pack(
+            padx=20, pady=(16, 8)
+        )
+
+        var_productos = tk.BooleanVar(value=True)
+        var_stock_bajo = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dialog, text="Lista de productos", variable=var_productos).pack(
+            anchor="w", padx=28
+        )
+        ttk.Checkbutton(dialog, text="Productos con stock bajo", variable=var_stock_bajo).pack(
+            anchor="w", padx=28, pady=(4, 0)
+        )
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=16, padx=20, fill="x")
+
+        def _generar():
+            if not var_productos.get() and not var_stock_bajo.get():
+                messagebox.showwarning("Aviso", "Seleccioná al menos una sección.", parent=dialog)
+                return
+            dialog.destroy()
+            filepath = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                initialfile="reporte_stock.pdf",
+                filetypes=[("PDF", "*.pdf"), ("Todos los archivos", "*.*")],
+            )
+            if not filepath:
+                return
+
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, "Reporte de Stock", ln=True, align="C")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(0, 6, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+            pdf.ln(6)
+
+            if var_productos.get():
+                productos = stock_app.list_products(self.conn)
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.cell(0, 8, "Lista de Productos", ln=True)
+                pdf.set_font("Helvetica", "B", 8)
+                headers = [("Código", 25), ("Nombre", 65), ("Precio", 22), ("Stock", 18), ("Mín.", 18), ("Proveedor", 42)]
+                for h, w in headers:
+                    pdf.cell(w, 7, h, border=1, align="C")
+                pdf.ln()
+                pdf.set_font("Helvetica", "", 8)
+                for p in productos:
+                    pdf.cell(25, 6, str(p["codigo"]), border=1)
+                    pdf.cell(65, 6, str(p["nombre"])[:38], border=1)
+                    pdf.cell(22, 6, f"${float(p['precio']):.2f}", border=1, align="R")
+                    pdf.cell(18, 6, str(p["stock"]), border=1, align="C")
+                    pdf.cell(18, 6, str(p["stock_minimo"]), border=1, align="C")
+                    pdf.cell(42, 6, str(p["proveedor"] or "-")[:22], border=1)
+                    pdf.ln()
+                pdf.ln(4)
+
+            if var_stock_bajo.get():
+                bajo = stock_app.low_stock_products(self.conn)
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.cell(0, 8, "Productos con Stock Bajo", ln=True)
+                pdf.set_font("Helvetica", "B", 8)
+                for h, w in [("Código", 30), ("Nombre", 90), ("Stock actual", 35), ("Stock mín.", 35)]:
+                    pdf.cell(w, 7, h, border=1, align="C")
+                pdf.ln()
+                pdf.set_font("Helvetica", "", 8)
+                for p in bajo:
+                    pdf.cell(30, 6, str(p["codigo"]), border=1)
+                    pdf.cell(90, 6, str(p["nombre"])[:48], border=1)
+                    pdf.cell(35, 6, str(p["stock"]), border=1, align="C")
+                    pdf.cell(35, 6, str(p["stock_minimo"]), border=1, align="C")
+                    pdf.ln()
+
+            pdf.output(filepath)
+            self._set_status(f"✓ PDF exportado: {Path(filepath).name}")
+
+        ttk.Button(btn_frame, text="Generar PDF", command=_generar).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
+
     # =========================================================================
     # Undo
     # =========================================================================
@@ -1216,7 +1379,8 @@ class StockGui(tk.Tk):
         clear_table(self.products_table)
         query = self.search_var.get().lower()
         for row in stock_app.list_products(self.conn):
-            if query and query not in row["codigo"].lower() and query not in row["nombre"].lower():
+            prov = (row["proveedor"] or "").lower()
+            if query and query not in row["codigo"].lower() and query not in row["nombre"].lower() and query not in prov:
                 continue
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
