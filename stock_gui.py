@@ -40,7 +40,6 @@ class StockGui(tk.Tk):
         self.precio_costo_var = tk.StringVar()
         self.stock_var = tk.StringVar()
         self.stock_minimo_var = tk.StringVar()
-        self.foto_var = tk.StringVar()
         self.proveedor_var = tk.StringVar()
         self.notas_var = tk.StringVar()
 
@@ -237,19 +236,10 @@ class StockGui(tk.Tk):
         ttk.Label(self._product_form_frame, text="Notas").grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
-        ttk.Label(self._product_form_frame, text="Foto").grid(
-            row=2, column=3, sticky="w", pady=(6, 0)
-        )
 
-        # row 3 — notas + foto + actions
+        # row 3 — notas + actions
         ttk.Entry(self._product_form_frame, textvariable=self.notas_var).grid(
-            row=3, column=0, columnspan=3, sticky="ew", padx=(0, 4)
-        )
-        ttk.Entry(self._product_form_frame, textvariable=self.foto_var).grid(
-            row=3, column=3, columnspan=2, sticky="ew", padx=(0, 4)
-        )
-        ttk.Button(self._product_form_frame, text="Buscar", command=self.choose_photo).grid(
-            row=3, column=5, sticky="ew", padx=(0, 4)
+            row=3, column=0, columnspan=6, sticky="ew", padx=(0, 4)
         )
         self._save_btn = ttk.Button(
             self._product_form_frame, text="Guardar", command=self.save_product
@@ -274,19 +264,18 @@ class StockGui(tk.Tk):
         ttk.Label(search_row, text="Buscar:").grid(row=0, column=0, padx=(0, 6))
         ttk.Entry(search_row, textvariable=self.search_var).grid(row=0, column=1, sticky="ew")
 
-        cols = ("codigo", "nombre", "precio", "margen", "stock", "minimo", "proveedor", "foto")
+        cols = ("codigo", "nombre", "precio", "margen", "stock", "minimo", "proveedor")
         self.products_table = ttk.Treeview(frame, columns=cols, show="headings", height=11)
         self.products_table.tag_configure("stock_critical", background="#ffcccc", foreground="#8b0000")
         self.products_table.tag_configure("stock_warning", background="#fff8e1")
         for col, label, width in (
             ("codigo", "Codigo", 95),
-            ("nombre", "Nombre", 145),
-            ("precio", "Precio", 68),
-            ("margen", "Margen", 60),
-            ("stock", "Stock", 50),
-            ("minimo", "Stock mín.", 60),
-            ("proveedor", "Proveedor", 95),
-            ("foto", "Foto", 40),
+            ("nombre", "Nombre", 165),
+            ("precio", "Precio", 80),
+            ("margen", "Margen", 70),
+            ("stock", "Stock", 60),
+            ("minimo", "Stock mín.", 70),
+            ("proveedor", "Proveedor", 110),
         ):
             self.products_table.heading(
                 col, text=label,
@@ -1362,20 +1351,8 @@ class StockGui(tk.Tk):
         self.precio_costo_var.set("")
         self.stock_var.set("")
         self.stock_minimo_var.set("")
-        self.foto_var.set("")
         self.proveedor_var.set("")
         self.notas_var.set("")
-
-    def choose_photo(self) -> None:
-        filename = filedialog.askopenfilename(
-            title="Seleccionar foto",
-            filetypes=(
-                ("Imagenes", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
-                ("Todos los archivos", "*.*"),
-            ),
-        )
-        if filename:
-            self.foto_var.set(filename)
 
     # =========================================================================
     # Create / edit product
@@ -1401,7 +1378,7 @@ class StockGui(tk.Tk):
                 raise ValueError("Codigo y nombre son obligatorios.")
             stock_app.add_product(
                 self.conn, codigo, nombre, precio, stock, stock_minimo,
-                self.foto_var.get() or None, proveedor, precio_costo, notas,
+                proveedor, precio_costo, notas,
             )
         except (ValueError, stock_app.StockError) as exc:
             messagebox.showerror("No se pudo guardar", str(exc))
@@ -1427,7 +1404,7 @@ class StockGui(tk.Tk):
                 self.conn,
                 self._edit_codigo,  # type: ignore[arg-type]
                 nombre, precio, stock, stock_minimo,
-                self.foto_var.get() or None, proveedor, precio_costo, notas,
+                proveedor, precio_costo, notas,
             )
         except (ValueError, stock_app.StockError) as exc:
             messagebox.showerror("No se pudo actualizar", str(exc))
@@ -1451,7 +1428,6 @@ class StockGui(tk.Tk):
         self.stock_minimo_var.set(str(product["stock_minimo"]))
         self.proveedor_var.set(product["proveedor"] or "")
         self.notas_var.set(product["notas"] or "")
-        self.foto_var.set("")
         self._codigo_entry.configure(state="readonly")
         self._save_btn.configure(text="Actualizar")
         self._product_form_frame.configure(text="Editar producto")
@@ -1646,13 +1622,15 @@ class StockGui(tk.Tk):
                 row["codigo"], row["nombre"], precio, margen,
                 row["stock"], row["stock_minimo"],
                 row["proveedor"] or "-",
-                "✓" if row["foto"] else "✗",
                 tag,
             ))
 
         # apply column sort
         col_idx = {"codigo": 0, "nombre": 1, "precio": 2, "margen": 3,
-                   "stock": 4, "minimo": 5, "proveedor": 6, "foto": 7}
+                   "stock": 4, "minimo": 5, "proveedor": 6}
+        label_map = {"codigo": "Codigo", "nombre": "Nombre", "precio": "Precio",
+                     "margen": "Margen", "stock": "Stock", "minimo": "Stock mín.",
+                     "proveedor": "Proveedor"}
         if self._sort_col in col_idx:
             idx = col_idx[self._sort_col]
             def _key(r: tuple) -> Any:
@@ -1664,19 +1642,15 @@ class StockGui(tk.Tk):
                         return v.lower()
                 return v
             rows_data.sort(key=_key, reverse=not self._sort_asc)
-            # update heading arrows
             for c in col_idx:
-                label_map = {"codigo": "Codigo", "nombre": "Nombre", "precio": "Precio",
-                             "margen": "Margen", "stock": "Stock", "minimo": "Stock mín.",
-                             "proveedor": "Proveedor", "foto": "Foto"}
                 arrow = (" ▲" if self._sort_asc else " ▼") if c == self._sort_col else ""
                 self.products_table.heading(c, text=label_map[c] + arrow)
 
         for row in rows_data:
             self.products_table.insert(
                 "", "end",
-                values=row[:8],
-                tags=(row[8],) if row[8] else (),
+                values=row[:7],
+                tags=(row[7],) if row[7] else (),
             )
 
     def refresh_alerts(self) -> None:

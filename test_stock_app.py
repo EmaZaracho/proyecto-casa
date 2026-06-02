@@ -28,8 +28,7 @@ class StockAppTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
         self.conn = stock_app.get_connection(self.db_path)
-        with patch.object(stock_app, "PHOTOS_DIR", Path(self.tmp.name) / "fotos_productos"):
-            stock_app.initialize_database(self.conn)
+        stock_app.initialize_database(self.conn)
 
     def tearDown(self):
         self.conn.close()
@@ -72,14 +71,6 @@ class StockAppTests(unittest.TestCase):
     def test_invalid_price_input_retries_until_valid_number(self):
         with patch("builtins.input", side_effect=["abc", "12,50"]):
             self.assertEqual(stock_app.read_float("Precio: "), 12.50)
-
-    def test_missing_photo_path_is_ignored_and_product_is_created(self):
-        stock_app.add_product(
-            self.conn, "779002", "Fideos", 900, 4, 1,
-            foto_path=str(Path(self.tmp.name) / "no_existe.jpg"),
-        )
-        product = stock_app.get_product(self.conn, "779002")
-        self.assertIsNone(product["foto"])
 
     # ── sale ──────────────────────────────────────────────────────────────────
 
@@ -205,12 +196,6 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(product["proveedor"], "ProvX")
         self.assertEqual(product["precio_costo"], 900.0)
         self.assertEqual(product["notas"], "Nueva nota")
-
-    def test_update_preserves_foto_when_no_new_path(self):
-        stock_app.add_product(self.conn, "UP002", "Sin foto", 100, 1, 0)
-        stock_app.update_product(self.conn, "UP002", "Sin foto v2", 200, 2, 0)
-        product = stock_app.get_product(self.conn, "UP002")
-        self.assertIsNone(product["foto"])
 
     def test_update_nonexistent_product_raises(self):
         with self.assertRaises(stock_app.ProductNotFoundError):
@@ -397,14 +382,10 @@ class ParseHelpersTests(unittest.TestCase):
 class StockGuiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        tmp_dir = Path(self.tmp.name)
-        db_path = tmp_dir / "test_gui.db"
-        photos_dir = tmp_dir / "fotos_productos"
+        db_path = Path(self.tmp.name) / "test_gui.db"
 
         self.test_conn = stock_app.get_connection(db_path)
-        self._photos_patch = patch.object(stock_app, "PHOTOS_DIR", photos_dir)
         self._conn_patch = patch.object(stock_app, "get_connection", return_value=self.test_conn)
-        self._photos_patch.start()
         self._conn_patch.start()
 
         self.app = stock_gui.StockGui()
@@ -416,7 +397,6 @@ class StockGuiTests(unittest.TestCase):
         except Exception:
             pass
         self._conn_patch.stop()
-        self._photos_patch.stop()
         self.test_conn.close()
         self.tmp.cleanup()
 

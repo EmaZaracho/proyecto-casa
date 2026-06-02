@@ -11,7 +11,6 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "stock.db"
-PHOTOS_DIR = BASE_DIR / "fotos_productos"
 CONFIG_PATH = BASE_DIR / "config.json"
 
 _DEFAULT_CONFIG: dict = {
@@ -62,8 +61,6 @@ _SCHEMA_VERSION = 2
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
-    PHOTOS_DIR.mkdir(exist_ok=True)
-
     # schema_version table — must be first so migrations can reference it
     conn.execute(
         """
@@ -172,22 +169,6 @@ def sanitize_path(raw_path: str) -> Path:
     return Path(cleaned)
 
 
-def save_product_photo(codigo: str, raw_path: str | None, photos_dir: Path = PHOTOS_DIR) -> str | None:
-    if not raw_path or not raw_path.strip():
-        return None
-
-    source = sanitize_path(raw_path)
-    if not source.is_file():
-        return None
-
-    photos_dir.mkdir(exist_ok=True)
-    safe_code = "".join(ch for ch in codigo if ch.isalnum() or ch in ("-", "_")).strip()
-    target_name = f"{safe_code}_{source.name}"
-    target = photos_dir / target_name
-    shutil.copy2(source, target)
-    return str(target.relative_to(BASE_DIR))
-
-
 def add_product(
     conn: sqlite3.Connection,
     codigo: str,
@@ -195,7 +176,6 @@ def add_product(
     precio: float,
     stock: int,
     stock_minimo: int,
-    foto_path: str | None = None,
     proveedor: str = "",
     precio_costo: float = 0.0,
     notas: str = "",
@@ -205,15 +185,14 @@ def add_product(
     if conn.execute("SELECT 1 FROM productos WHERE codigo = ?", (codigo,)).fetchone():
         raise DuplicateProductError(f"Ya existe un producto con codigo {codigo}.")
 
-    foto = save_product_photo(codigo, foto_path)
     try:
         conn.execute(
             """
             INSERT INTO productos
-                (codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (codigo, nombre, precio, stock, stock_minimo, proveedor, precio_costo, notas)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (codigo, nombre, precio, stock, stock_minimo, foto,
+            (codigo, nombre, precio, stock, stock_minimo,
              proveedor.strip(), precio_costo, notas.strip()),
         )
         conn.commit()
@@ -228,29 +207,25 @@ def update_product(
     precio: float,
     stock: int,
     stock_minimo: int,
-    foto_path: str | None = None,
     proveedor: str = "",
     precio_costo: float = 0.0,
     notas: str = "",
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
-    row = conn.execute("SELECT foto, precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
+    row = conn.execute("SELECT precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
     if row is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
-
-    new_foto = save_product_photo(codigo, foto_path)
-    foto = new_foto if new_foto is not None else row["foto"]
 
     try:
         conn.execute(
             """
             UPDATE productos
             SET nombre = ?, precio = ?, stock = ?, stock_minimo = ?,
-                foto = ?, proveedor = ?, precio_costo = ?, notas = ?
+                proveedor = ?, precio_costo = ?, notas = ?
             WHERE codigo = ?
             """,
-            (nombre, precio, stock, stock_minimo, foto,
+            (nombre, precio, stock, stock_minimo,
              proveedor.strip(), precio_costo, notas.strip(), codigo),
         )
         if float(row["precio"]) != precio:
