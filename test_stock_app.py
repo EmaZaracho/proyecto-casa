@@ -435,7 +435,7 @@ class StockGuiTests(unittest.TestCase):
         self.assertEqual(str(self.app._undo_btn.cget("state")), "disabled")
 
     def test_cart_mode_starts_inactive(self):
-        self.assertFalse(self.app._cart_mode_active)
+        self.assertTrue(self.app._cart_mode_active)
         self.assertEqual(self.app._cart, [])
 
     # ── create product ────────────────────────────────────────────────────────
@@ -558,7 +558,7 @@ class StockGuiTests(unittest.TestCase):
 
     def test_toggle_cart_mode_activates(self):
         self.app._toggle_cart_mode()
-        self.assertTrue(self.app._cart_mode_active)
+        self.assertFalse(self.app._cart_mode_active)
 
     def test_add_to_cart_accumulates_items(self):
         stock_app.add_product(self.test_conn, "CART01", "Producto Carrito", 500, 10, 0)

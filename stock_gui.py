@@ -190,7 +190,7 @@ class StockGui(tk.Tk):
         self._build_product_form(left)
         self._build_product_table(left)
         self._build_sale_box(right)
-        self._toggle_cart_mode()  # arranca en modo carrito
+        self._toggle_cart_mode()  # arranca en modo carrito (activo por defecto)
         self._build_alerts_box(right)
         self._build_pending_box(right)
 
