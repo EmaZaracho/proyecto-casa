@@ -13,6 +13,21 @@ import stock_app
 _UNDO_MAX = 10
 _FORMAS_PAGO = ("Efectivo", "Transferencia", "Tarjeta")
 
+_COLORS_LIGHT = dict(
+    bg="#f0f0f0", bg_widget="#ffffff", fg="#000000", fg_muted="gray",
+    btn_bg="#e1e1e1", sel_bg="#0078d7", sel_fg="#ffffff",
+    tree_bg="#ffffff", heading_bg="#dcdcdc", heading_fg="#000000",
+    critical_bg="#ffcccc", critical_fg="#8b0000",
+    warning_bg="#fff8e1", warning_fg="#000000",
+)
+_COLORS_DARK = dict(
+    bg="#2b2b2b", bg_widget="#3c3f41", fg="#cccccc", fg_muted="#888888",
+    btn_bg="#4c4c4c", sel_bg="#4b6eaf", sel_fg="#ffffff",
+    tree_bg="#313335", heading_bg="#4c4f52", heading_fg="#cccccc",
+    critical_bg="#5c1a1a", critical_fg="#ff9090",
+    warning_bg="#4a3d00", warning_fg="#ffd54f",
+)
+
 logging.basicConfig(
     filename=stock_app.BASE_DIR / "stock.log",
     level=logging.ERROR,
@@ -32,6 +47,8 @@ class StockGui(tk.Tk):
         self.conn = stock_app.get_connection()
         stock_app.initialize_database(self.conn)
         self._config = stock_app.load_config()
+        self._dark_mode: bool = bool(self._config.get("dark_mode", False))
+        self._muted_labels: list[ttk.Label] = []
 
         # ── product form vars ──
         self.codigo_var = tk.StringVar()
@@ -130,11 +147,18 @@ class StockGui(tk.Tk):
         self._undo_btn = ttk.Button(
             hdr, text="↩ Deshacer (Ctrl+Z)", command=self._undo, state="disabled"
         )
-        self._undo_btn.grid(row=0, column=3)
+        self._undo_btn.grid(row=0, column=3, padx=(6, 0))
+        self._dark_mode_btn = ttk.Button(
+            hdr, text="🌙" if not self._dark_mode else "☀", width=3,
+            command=self._toggle_dark_mode,
+        )
+        self._dark_mode_btn.grid(row=0, column=4, padx=(6, 0))
 
         # shortcuts hint
-        ttk.Label(hdr, text="F1=Venta  F2=Producto  F3=Pendiente",
-                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        _shortcuts_lbl = ttk.Label(hdr, text="F1=Venta  F2=Producto  F3=Pendiente",
+                                   foreground="gray")
+        _shortcuts_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        self._muted_labels.append(_shortcuts_lbl)
 
         # notebook
         self._notebook = ttk.Notebook(outer)
@@ -160,6 +184,8 @@ class StockGui(tk.Tk):
             relief="sunken", anchor="w", padding=(6, 2),
         )
         status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        self._apply_theme()
 
     # ── Tab 1 ─────────────────────────────────────────────────────────────────
 
@@ -266,8 +292,6 @@ class StockGui(tk.Tk):
 
         cols = ("codigo", "nombre", "precio", "margen", "stock", "minimo", "proveedor")
         self.products_table = ttk.Treeview(frame, columns=cols, show="headings", height=11)
-        self.products_table.tag_configure("stock_critical", background="#ffcccc", foreground="#8b0000")
-        self.products_table.tag_configure("stock_warning", background="#fff8e1")
         for col, label, width in (
             ("codigo", "Codigo", 95),
             ("nombre", "Nombre", 165),
@@ -299,11 +323,13 @@ class StockGui(tk.Tk):
             row=0, column=2, padx=(0, 6)
         )
         ttk.Button(actions, text="Actualizar lista", command=self.refresh_all).grid(row=0, column=3)
-        ttk.Label(
+        _consejo_lbl = ttk.Label(
             frame,
             text="Consejo: doble clic en una fila para editarla",
             foreground="gray",
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        )
+        _consejo_lbl.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._muted_labels.append(_consejo_lbl)
 
     def _build_sale_box(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Venta", padding=8)
@@ -327,6 +353,7 @@ class StockGui(tk.Tk):
             font=("Segoe UI", 8),
         )
         self._producto_preview_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
+        self._muted_labels.append(self._producto_preview_label)
 
         # row 2: cantidad
         ttk.Label(frame, text="Cantidad").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
@@ -416,8 +443,6 @@ class StockGui(tk.Tk):
         ):
             self.alerts_table.heading(col, text=label)
             self.alerts_table.column(col, width=width, minwidth=40)
-        self.alerts_table.tag_configure("critical", background="#ffcccc", foreground="#8b0000")
-        self.alerts_table.tag_configure("warning", background="#fff8e1")
         self.alerts_table.grid(row=0, column=0, sticky="nsew")
 
     def _build_pending_box(self, parent: ttk.Frame) -> None:
@@ -1702,6 +1727,79 @@ class StockGui(tk.Tk):
                 ),
             )
         self._on_price_selection_change()
+
+    # =========================================================================
+    # Tema / Modo oscuro
+    # =========================================================================
+
+    def _apply_theme(self) -> None:
+        c = _COLORS_DARK if self._dark_mode else _COLORS_LIGHT
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        self.configure(bg=c["bg"])
+
+        style.configure(".", background=c["bg"], foreground=c["fg"])
+        style.configure("TFrame", background=c["bg"])
+        style.configure("TLabelframe", background=c["bg"], bordercolor=c["fg_muted"])
+        style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+        style.configure("TLabel", background=c["bg"], foreground=c["fg"])
+        style.configure("Title.TLabel", background=c["bg"], foreground=c["fg"],
+                        font=("Segoe UI", 13, "bold"))
+        style.configure("Bold.TLabel", background=c["bg"], foreground=c["fg"],
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", background=c["btn_bg"], foreground=c["fg"], borderwidth=1)
+        style.map("TButton",
+                  background=[("active", c["sel_bg"]), ("pressed", c["sel_bg"])],
+                  foreground=[("active", c["sel_fg"]), ("pressed", c["sel_fg"])])
+        style.configure("TEntry", fieldbackground=c["bg_widget"], foreground=c["fg"],
+                        insertcolor=c["fg"])
+        style.configure("TCombobox", fieldbackground=c["bg_widget"], foreground=c["fg"])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["bg_widget"])],
+                  foreground=[("readonly", c["fg"])],
+                  selectbackground=[("readonly", c["sel_bg"])],
+                  selectforeground=[("readonly", c["sel_fg"])])
+        style.configure("Treeview", background=c["tree_bg"], foreground=c["fg"],
+                        fieldbackground=c["tree_bg"])
+        style.configure("Treeview.Heading", background=c["heading_bg"],
+                        foreground=c["heading_fg"], relief="flat")
+        style.map("Treeview",
+                  background=[("selected", c["sel_bg"])],
+                  foreground=[("selected", c["sel_fg"])])
+        style.configure("TNotebook", background=c["bg"])
+        style.configure("TNotebook.Tab", background=c["bg"], foreground=c["fg"],
+                        padding=(8, 4))
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["bg_widget"])],
+                  foreground=[("selected", c["fg"])])
+        style.configure("TScrollbar", background=c["bg"], troughcolor=c["bg_widget"],
+                        arrowcolor=c["fg"])
+        style.configure("TSeparator", background=c["fg_muted"])
+
+        for lbl in self._muted_labels:
+            try:
+                lbl.configure(foreground=c["fg_muted"])
+            except tk.TclError:
+                pass
+
+        for tree, tag in (
+            (self.products_table, "stock_critical"),
+            (self.products_table, "stock_warning"),
+            (self.alerts_table, "critical"),
+            (self.alerts_table, "warning"),
+        ):
+            if "critical" in tag:
+                tree.tag_configure(tag, background=c["critical_bg"], foreground=c["critical_fg"])
+            else:
+                tree.tag_configure(tag, background=c["warning_bg"], foreground=c["warning_fg"])
+
+    def _toggle_dark_mode(self) -> None:
+        self._dark_mode = not self._dark_mode
+        self._config["dark_mode"] = self._dark_mode
+        stock_app.save_config(self._config)
+        self._dark_mode_btn.configure(text="☀" if self._dark_mode else "🌙")
+        self._apply_theme()
 
     def on_close(self) -> None:
         self.conn.close()
