@@ -315,7 +315,10 @@ class StockGui(tk.Tk):
 
         actions = ttk.Frame(frame)
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(4, weight=1)
+        ttk.Button(actions, text="Agregar al carrito", command=self.add_selected_to_cart).grid(
+            row=0, column=0, padx=(0, 6)
+        )
         ttk.Button(actions, text="Cargar para editar", command=self.load_selected_for_edit).grid(
             row=0, column=1, padx=(0, 6)
         )
@@ -398,6 +401,7 @@ class StockGui(tk.Tk):
             self._cart_table.column(col, width=width, minwidth=30)
         self._cart_table.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self._cart_table.grid_remove()
+        self._cart_table.bind("<Double-1>", lambda _: self.load_selected_cart_for_edit())
 
         self._cart_total_label = ttk.Label(
             frame, textvariable=self._cart_total_var, style="Bold.TLabel"
@@ -760,6 +764,18 @@ class StockGui(tk.Tk):
         except ValueError:
             return None
 
+    def _center_dialog(self, dialog: tk.Toplevel) -> None:
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        if width <= 1:
+            width = dialog.winfo_reqwidth()
+        if height <= 1:
+            height = dialog.winfo_reqheight()
+        x = self.winfo_rootx() + (self.winfo_width() - width) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
     # =========================================================================
     # Autocompletado de producto en venta
     # =========================================================================
@@ -786,6 +802,7 @@ class StockGui(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title("Buscar producto")
         dialog.geometry("420x320")
+        dialog.transient(self)
         dialog.grab_set()
 
         ttk.Label(dialog, text="Buscar por nombre o código:").pack(padx=12, pady=(12, 4), anchor="w")
@@ -824,6 +841,7 @@ class StockGui(tk.Tk):
         listbox.bind("<Double-1>", _select)
         listbox.bind("<Return>", _select)
         ttk.Button(dialog, text="Seleccionar", command=_select).pack(pady=(0, 10))
+        self._center_dialog(dialog)
 
     # =========================================================================
     # Ordenamiento de tabla de productos
@@ -845,6 +863,7 @@ class StockGui(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title("Configuración")
         dialog.resizable(False, False)
+        dialog.transient(self)
         dialog.grab_set()
 
         frame = ttk.Frame(dialog, padding=20)
@@ -871,6 +890,7 @@ class StockGui(tk.Tk):
 
         ttk.Button(btn_frame, text="Guardar", command=_guardar).pack(side="right", padx=(8, 0))
         ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
+    self._center_dialog(dialog)
 
     # =========================================================================
     # Proveedor autocomplete
@@ -939,9 +959,13 @@ class StockGui(tk.Tk):
                 self._start_add_product_with_code(codigo)
             return
 
+        previous_quantity = 0
+        previous_item: dict[str, Any] | None = None
         # merge if already in cart
         for item in self._cart:
             if item["codigo"] == codigo:
+                previous_quantity = int(item["cantidad"])
+                previous_item = dict(item)
                 item["cantidad"] += cantidad
                 item["subtotal"] = item["cantidad"] * item["precio_unit"]
                 break
@@ -954,10 +978,113 @@ class StockGui(tk.Tk):
                 "subtotal": cantidad * float(product["precio"]),
             })
 
+        self._push_undo({
+            "type": "cart_change",
+            "codigo": codigo,
+            "previous_quantity": previous_quantity,
+            "new_quantity": previous_quantity + cantidad,
+            "previous_item": previous_item,
+            "description": f"carrito {cantidad}x '{codigo}'",
+        })
         self.venta_codigo_var.set("")
         self.venta_cantidad_var.set("1")
         self._refresh_cart_display()
         self._venta_codigo_entry.focus_set()
+
+    def _find_cart_item_index(self, codigo: str) -> int:
+        for index, item in enumerate(self._cart):
+            if item["codigo"] == codigo:
+                return index
+        return -1
+
+    def add_selected_to_cart(self) -> None:
+        selected = self.products_table.selection()
+        if not selected:
+            messagebox.showerror("Seleccione un producto", "Elija un producto de la lista.")
+            return
+
+        codigo = self.products_table.item(selected[0], "values")[0]
+        self.venta_codigo_var.set(codigo)
+        if not self._cart_mode_active:
+            self._toggle_cart_mode()
+        self._add_to_cart()
+
+    def load_selected_cart_for_edit(self) -> None:
+        selected = self._cart_table.selection()
+        if not selected:
+            return
+
+        idx = self._cart_table.index(selected[0])
+        if not (0 <= idx < len(self._cart)):
+            return
+
+        self._edit_cart_item_dialog(idx)
+
+    def _edit_cart_item_dialog(self, idx: int) -> None:
+        item = self._cart[idx]
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Editar producto del carrito")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Producto:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(frame, text=item["nombre"]).grid(row=0, column=1, sticky="w", pady=(0, 6))
+
+        ttk.Label(frame, text="Código:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(frame, text=item["codigo"]).grid(row=1, column=1, sticky="w", pady=(0, 6))
+
+        qty_var = tk.StringVar(value=str(item["cantidad"]))
+        ttk.Label(frame, text="Cantidad:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        qty_entry = ttk.Entry(frame, textvariable=qty_var, width=12)
+        qty_entry.grid(row=2, column=1, sticky="w", pady=(0, 10))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=3, column=0, columnspan=2, sticky="e")
+
+        def _save() -> None:
+            try:
+                new_quantity = parse_int(qty_var.get(), "cantidad")
+            except ValueError as exc:
+                messagebox.showerror("Valor invalido", str(exc), parent=dialog)
+                return
+            if new_quantity <= 0:
+                messagebox.showerror(
+                    "Valor invalido",
+                    "La cantidad debe ser mayor a 0.",
+                    parent=dialog,
+                )
+                return
+
+            previous_quantity = int(item["cantidad"])
+            if new_quantity == previous_quantity:
+                dialog.destroy()
+                return
+
+            self._cart[idx]["cantidad"] = new_quantity
+            self._cart[idx]["subtotal"] = new_quantity * float(self._cart[idx]["precio_unit"])
+            self._push_undo({
+                "type": "cart_change",
+                "codigo": item["codigo"],
+                "previous_quantity": previous_quantity,
+                "new_quantity": new_quantity,
+                "description": f"editar carrito '{item['codigo']}'",
+            })
+            self._refresh_cart_display()
+            dialog.destroy()
+
+        ttk.Button(btn_row, text="Guardar", command=_save).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_row, text="Cancelar", command=dialog.destroy).pack(side="right")
+
+        self._center_dialog(dialog)
+
+        qty_entry.focus_set()
+        qty_entry.selection_range(0, tk.END)
 
     def _refresh_cart_display(self) -> None:
         clear_table(self._cart_table)
@@ -981,10 +1108,22 @@ class StockGui(tk.Tk):
             return
         idx = self._cart_table.index(selected[0])
         if 0 <= idx < len(self._cart):
-            self._cart.pop(idx)
+            item = dict(self._cart.pop(idx))
+            self._push_undo({
+                "type": "cart_remove",
+                "item": item,
+                "index": idx,
+                "description": f"quitar carrito '{item['codigo']}'",
+            })
         self._refresh_cart_display()
 
     def _clear_cart(self) -> None:
+        if self._cart:
+            self._push_undo({
+                "type": "cart_clear",
+                "items": [dict(item) for item in self._cart],
+                "description": f"vaciar carrito ({len(self._cart)})",
+            })
         self._cart.clear()
         self._refresh_cart_display()
 
@@ -1162,6 +1301,7 @@ class StockGui(tk.Tk):
         top.title("Cierre de caja")
         top.geometry("440x420")
         top.resizable(False, False)
+        top.transient(self)
         top.grab_set()
 
         frame = ttk.Frame(top, padding=20)
@@ -1202,6 +1342,7 @@ class StockGui(tk.Tk):
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
         ttk.Button(frame, text="Cerrar", command=top.destroy).pack(anchor="e")
+    self._center_dialog(top)
 
     def _export_ventas_csv(self) -> None:
         filepath = filedialog.asksaveasfilename(
@@ -1235,6 +1376,7 @@ class StockGui(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title("Exportar PDF")
         dialog.resizable(False, False)
+        dialog.transient(self)
         dialog.grab_set()
 
         ttk.Label(dialog, text="¿Qué incluir en el PDF?", font=("Segoe UI", 10, "bold")).pack(
@@ -1316,6 +1458,7 @@ class StockGui(tk.Tk):
 
         ttk.Button(btn_frame, text="Generar PDF", command=_generar).pack(side="right", padx=(8, 0))
         ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
+    self._center_dialog(dialog)
 
     # =========================================================================
     # Undo
@@ -1334,6 +1477,7 @@ class StockGui(tk.Tk):
         if not self._undo_stack:
             return
         action = self._undo_stack.pop()
+        cart_action_handled = False
         try:
             if action["type"] == "delete_product":
                 stock_app._restore_product(self.conn, action["data"])
@@ -1352,9 +1496,32 @@ class StockGui(tk.Tk):
                         (old_price, codigo),
                     )
                 self.conn.commit()
+            elif action["type"] == "cart_change":
+                idx = self._find_cart_item_index(action["codigo"])
+                previous_quantity = int(action.get("previous_quantity", 0))
+                if previous_quantity <= 0:
+                    if idx != -1:
+                        self._cart.pop(idx)
+                elif idx != -1:
+                    self._cart[idx]["cantidad"] = previous_quantity
+                    self._cart[idx]["subtotal"] = previous_quantity * self._cart[idx]["precio_unit"]
+                cart_action_handled = True
+            elif action["type"] == "cart_remove":
+                item = dict(action["item"])
+                index = int(action.get("index", len(self._cart)))
+                if index < 0 or index > len(self._cart):
+                    index = len(self._cart)
+                self._cart.insert(index, item)
+                cart_action_handled = True
+            elif action["type"] == "cart_clear":
+                self._cart = [dict(item) for item in action.get("items", [])]
+                cart_action_handled = True
         except Exception as exc:
             messagebox.showerror("Error al deshacer", str(exc))
             return
+
+        if cart_action_handled:
+            self._refresh_cart_display()
 
         if not self._undo_stack:
             self._undo_btn.configure(state="disabled", text="↩ Deshacer (Ctrl+Z)")
