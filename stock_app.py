@@ -57,7 +57,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -117,7 +117,9 @@ def initialize_database(conn: sqlite3.Connection) -> None:
             precio_unit REAL NOT NULL,
             total REAL NOT NULL,
             fecha TEXT NOT NULL,
-            hora TEXT NOT NULL
+            hora TEXT NOT NULL,
+            forma_pago TEXT NOT NULL DEFAULT 'Efectivo',
+            precio_costo REAL NOT NULL DEFAULT 0
         )
         """
     )
@@ -154,6 +156,11 @@ def initialize_database(conn: sqlite3.Connection) -> None:
     if current_version < 2:
         if not _col_exists("ventas", "forma_pago"):
             conn.execute("ALTER TABLE ventas ADD COLUMN forma_pago TEXT NOT NULL DEFAULT 'Efectivo'")
+
+    # v2 → v3: add precio_costo to ventas (for profit tracking)
+    if current_version < 3:
+        if not _col_exists("ventas", "precio_costo"):
+            conn.execute("ALTER TABLE ventas ADD COLUMN precio_costo REAL NOT NULL DEFAULT 0")
 
     # update stored version
     if current_version == 0:
@@ -270,6 +277,36 @@ def list_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def search_products(conn: sqlite3.Connection, query: str = "") -> list[sqlite3.Row]:
+    if not query:
+        return list_products(conn)
+    q = f"%{query.lower()}%"
+    return conn.execute(
+        """
+        SELECT codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas
+        FROM productos
+        WHERE lower(codigo) LIKE ? OR lower(nombre) LIKE ? OR lower(proveedor) LIKE ?
+        ORDER BY nombre
+        """,
+        (q, q, q),
+    ).fetchall()
+
+
+def adjust_stock(conn: sqlite3.Connection, codigo: str, nuevo_stock: int) -> int:
+    """Sets the product stock to nuevo_stock. Returns the previous stock value."""
+    row = conn.execute(
+        "SELECT stock FROM productos WHERE codigo = ?", (codigo.strip(),)
+    ).fetchone()
+    if row is None:
+        raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
+    stock_anterior = int(row["stock"])
+    conn.execute(
+        "UPDATE productos SET stock = ? WHERE codigo = ?", (nuevo_stock, codigo.strip())
+    )
+    conn.commit()
+    return stock_anterior
+
+
 def get_product(conn: sqlite3.Connection, codigo: str) -> sqlite3.Row:
     product = conn.execute("SELECT * FROM productos WHERE codigo = ?", (codigo.strip(),)).fetchone()
     if product is None:
@@ -353,7 +390,8 @@ def register_sale(
     sale_hour = datetime.now().strftime("%H:%M:%S")
     with conn:
         product = conn.execute(
-            "SELECT codigo, nombre, precio, stock FROM productos WHERE codigo = ?", (codigo.strip(),)
+            "SELECT codigo, nombre, precio, stock, precio_costo FROM productos WHERE codigo = ?",
+            (codigo.strip(),),
         ).fetchone()
         if product is None:
             raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
@@ -376,11 +414,12 @@ def register_sale(
         )
         conn.execute(
             """
-            INSERT INTO ventas (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO ventas
+                (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
-             total, sale_day, sale_hour, forma_pago),
+             total, sale_day, sale_hour, forma_pago, float(product["precio_costo"])),
         )
     return total
 
@@ -399,8 +438,8 @@ def reverse_sale(
             (cantidad, codigo.strip()),
         )
         conn.execute(
-            "UPDATE caja SET total = MAX(0, total - ?) WHERE fecha = ?",
-            (total, sale_date),
+            "UPDATE caja SET total = CASE WHEN total - ? < 0 THEN 0 ELSE total - ? END WHERE fecha = ?",
+            (total, total, sale_date),
         )
         conn.execute(
             """
@@ -449,10 +488,22 @@ def get_ventas_hoy(conn: sqlite3.Connection, cash_date: date | None = None) -> l
     day = (cash_date or date.today()).isoformat()
     return conn.execute(
         """
-        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total, forma_pago
+        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total, forma_pago, fecha
         FROM ventas WHERE fecha = ? ORDER BY id DESC
         """,
         (day,),
+    ).fetchall()
+
+
+def get_ventas_rango(
+    conn: sqlite3.Connection, fecha_desde: str, fecha_hasta: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, hora, codigo, nombre, cantidad, precio_unit, total, forma_pago, fecha
+        FROM ventas WHERE fecha >= ? AND fecha <= ? ORDER BY fecha DESC, id DESC
+        """,
+        (fecha_desde, fecha_hasta),
     ).fetchall()
 
 
@@ -482,7 +533,50 @@ def get_daily_summary(conn: sqlite3.Connection, cash_date: date | None = None) -
         """,
         (day,),
     ).fetchall()
-    return {"fecha": day, "total": total, "count": count, "top_products": top}
+    costo_row = conn.execute(
+        "SELECT COALESCE(SUM(precio_costo * cantidad), 0) FROM ventas WHERE fecha = ?", (day,)
+    ).fetchone()
+    total_costo = float(costo_row[0])
+    return {
+        "fecha": day, "total": total, "count": count, "top_products": top,
+        "total_costo": total_costo, "ganancia_bruta": total - total_costo,
+    }
+
+
+def get_range_summary(conn: sqlite3.Connection, fecha_desde: str, fecha_hasta: str) -> dict:
+    total = float(conn.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha >= ? AND fecha <= ?",
+        (fecha_desde, fecha_hasta),
+    ).fetchone()[0])
+    count = conn.execute(
+        "SELECT COUNT(*) FROM ventas WHERE fecha >= ? AND fecha <= ?",
+        (fecha_desde, fecha_hasta),
+    ).fetchone()[0]
+    breakdown = conn.execute(
+        """
+        SELECT forma_pago, COUNT(*) AS cantidad, SUM(total) AS total
+        FROM ventas WHERE fecha >= ? AND fecha <= ?
+        GROUP BY forma_pago ORDER BY total DESC
+        """,
+        (fecha_desde, fecha_hasta),
+    ).fetchall()
+    top = conn.execute(
+        """
+        SELECT nombre, SUM(cantidad) AS total_cant, SUM(total) AS total_monto
+        FROM ventas WHERE fecha >= ? AND fecha <= ?
+        GROUP BY codigo ORDER BY total_monto DESC LIMIT 5
+        """,
+        (fecha_desde, fecha_hasta),
+    ).fetchall()
+    total_costo = float(conn.execute(
+        "SELECT COALESCE(SUM(precio_costo * cantidad), 0) FROM ventas WHERE fecha >= ? AND fecha <= ?",
+        (fecha_desde, fecha_hasta),
+    ).fetchone()[0])
+    return {
+        "desde": fecha_desde, "hasta": fecha_hasta,
+        "total": total, "count": count, "breakdown": breakdown, "top_products": top,
+        "total_costo": total_costo, "ganancia_bruta": total - total_costo,
+    }
 
 
 def backup_database() -> Path | None:
@@ -569,10 +663,9 @@ def create_product_flow(conn: sqlite3.Connection) -> None:
     stock_minimo = read_int("Stock minimo: ")
     proveedor = read_text("Proveedor (opcional): ", required=False)
     notas = read_text("Notas (opcional): ", required=False)
-    foto_path = read_text("Ruta de foto (opcional): ", required=False)
     try:
         add_product(conn, codigo, nombre, precio, stock, stock_minimo,
-                    foto_path, proveedor, precio_costo, notas)
+                    proveedor, precio_costo, notas)
         print("Producto registrado.")
     except DuplicateProductError as exc:
         print(exc)

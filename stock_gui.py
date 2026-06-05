@@ -86,6 +86,9 @@ class StockGui(tk.Tk):
         # ── ventas tab vars ──
         self._ventas_date_var = tk.StringVar(value=date.today().isoformat())
         self._ventas_total_var = tk.StringVar(value="Total del día: $0.00")
+        self._ventas_desde_var = tk.StringVar(value="")
+        self._ventas_hasta_var = tk.StringVar(value="")
+        self._ventas_range_active = False
 
         # ── sorting state ──
         self._sort_col: str = ""
@@ -276,6 +279,7 @@ class StockGui(tk.Tk):
         )
         self._cancel_edit_btn.grid(row=3, column=7, sticky="ew")
         self._cancel_edit_btn.grid_remove()
+
         self._product_form_frame.grid_remove()
 
     def _build_product_table(self, parent: ttk.Frame) -> None:
@@ -322,10 +326,13 @@ class StockGui(tk.Tk):
         ttk.Button(actions, text="Cargar para editar", command=self.load_selected_for_edit).grid(
             row=0, column=1, padx=(0, 6)
         )
-        ttk.Button(actions, text="Eliminar", command=self.delete_selected_product).grid(
+        ttk.Button(actions, text="Ajustar stock", command=self._show_ajuste_stock).grid(
             row=0, column=2, padx=(0, 6)
         )
-        ttk.Button(actions, text="Actualizar lista", command=self.refresh_all).grid(row=0, column=3)
+        ttk.Button(actions, text="Eliminar", command=self.delete_selected_product).grid(
+            row=0, column=3, padx=(0, 6)
+        )
+        ttk.Button(actions, text="Actualizar lista", command=self.refresh_all).grid(row=0, column=4)
         _consejo_lbl = ttk.Label(
             frame,
             text="Consejo: doble clic en una fila para editarla",
@@ -630,34 +637,48 @@ class StockGui(tk.Tk):
     # ── Tab 3: sales of the day ───────────────────────────────────────────────
 
     def _build_tab_ventas(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
 
         # ── date navigation + summary ─────────────────────────────────────────
-        top_row = ttk.Frame(parent)
-        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        top_row.columnconfigure(2, weight=1)
+        nav_frame = ttk.Frame(parent)
+        nav_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        nav_frame.columnconfigure(4, weight=1)
 
-        ttk.Button(top_row, text="◀", width=3, command=self._ventas_prev_day).grid(
-            row=0, column=0, padx=(0, 2)
-        )
-        ttk.Entry(top_row, textvariable=self._ventas_date_var, width=12).grid(
-            row=0, column=1, padx=(0, 2)
-        )
-        ttk.Button(top_row, text="▶", width=3, command=self._ventas_next_day).grid(
-            row=0, column=2, sticky="w", padx=(0, 10)
-        )
-        ttk.Button(top_row, text="Hoy", command=self._ventas_go_today).grid(
-            row=0, column=3, padx=(0, 14)
-        )
+        self._nav_prev_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._ventas_prev_day)
+        self._nav_prev_btn.grid(row=0, column=0, padx=(0, 2))
+        self._nav_date_entry = ttk.Entry(nav_frame, textvariable=self._ventas_date_var, width=12)
+        self._nav_date_entry.grid(row=0, column=1, padx=(0, 2))
+        self._nav_next_btn = ttk.Button(nav_frame, text="▶", width=3, command=self._ventas_next_day)
+        self._nav_next_btn.grid(row=0, column=2, padx=(0, 10))
+        self._nav_today_btn = ttk.Button(nav_frame, text="Hoy", command=self._ventas_go_today)
+        self._nav_today_btn.grid(row=0, column=3, padx=(0, 14))
         ttk.Label(
-            top_row, textvariable=self._ventas_summary_var,
+            nav_frame, textvariable=self._ventas_summary_var,
             font=("Segoe UI", 11, "bold"),
         ).grid(row=0, column=4, sticky="e")
 
+        # ── date range filter ─────────────────────────────────────────────────
+        range_frame = ttk.Frame(parent)
+        range_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(range_frame, text="Rango — Desde:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(range_frame, textvariable=self._ventas_desde_var, width=12).grid(
+            row=0, column=1, padx=(0, 8)
+        )
+        ttk.Label(range_frame, text="Hasta:").grid(row=0, column=2, padx=(0, 4))
+        ttk.Entry(range_frame, textvariable=self._ventas_hasta_var, width=12).grid(
+            row=0, column=3, padx=(0, 8)
+        )
+        ttk.Button(range_frame, text="Filtrar rango", command=self._ventas_filtrar_rango).grid(
+            row=0, column=4, padx=(0, 4)
+        )
+        ttk.Button(range_frame, text="Limpiar", command=self._ventas_limpiar_rango).grid(
+            row=0, column=5
+        )
+
         # ── ventas table ─────────────────────────────────────────────────────
         self._ventas_table_frame = ttk.LabelFrame(parent, text="Ventas", padding=8)
-        self._ventas_table_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        self._ventas_table_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
         self._ventas_table_frame.rowconfigure(0, weight=1)
         self._ventas_table_frame.columnconfigure(0, weight=1)
 
@@ -683,12 +704,12 @@ class StockGui(tk.Tk):
         # ── total footer ──────────────────────────────────────────────────────
         ttk.Label(parent, textvariable=self._ventas_total_var,
                   font=("Segoe UI", 10, "bold")).grid(
-            row=2, column=0, sticky="e", pady=(0, 4)
+            row=3, column=0, sticky="e", pady=(0, 4)
         )
 
         # ── buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(parent)
-        btn_row.grid(row=3, column=0, sticky="ew")
+        btn_row.grid(row=4, column=0, sticky="ew")
         btn_row.columnconfigure(0, weight=1)
         ttk.Button(btn_row, text="Refrescar", command=self.refresh_ventas).grid(
             row=0, column=1, padx=(0, 6)
@@ -890,7 +911,7 @@ class StockGui(tk.Tk):
 
         ttk.Button(btn_frame, text="Guardar", command=_guardar).pack(side="right", padx=(8, 0))
         ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
-    self._center_dialog(dialog)
+        self._center_dialog(dialog)
 
     # =========================================================================
     # Proveedor autocomplete
@@ -1262,25 +1283,49 @@ class StockGui(tk.Tk):
     # =========================================================================
 
     def refresh_ventas(self) -> None:
-        selected_date = self._selected_ventas_date()
         clear_table(self.ventas_table)
         running_total = 0.0
-        for row in stock_app.get_ventas_hoy(self.conn, cash_date=selected_date):
-            running_total += float(row["total"])
-            self.ventas_table.insert(
-                "", "end",
-                values=(
-                    row["hora"],
-                    row["codigo"],
-                    row["nombre"],
-                    row["cantidad"],
-                    f"${row['precio_unit']:.2f}",
-                    f"${row['total']:.2f}",
-                    row["forma_pago"],
-                ),
+        if self._ventas_range_active:
+            ventas = stock_app.get_ventas_rango(
+                self.conn, self._ventas_desde_var.get(), self._ventas_hasta_var.get()
             )
-        self._ventas_total_var.set(f"Total del día: ${running_total:.2f}")
-        self._update_ventas_summary()
+            for row in ventas:
+                running_total += float(row["total"])
+                self.ventas_table.insert(
+                    "", "end",
+                    values=(
+                        f"{row['fecha']} {row['hora']}",
+                        row["codigo"],
+                        row["nombre"],
+                        row["cantidad"],
+                        f"${row['precio_unit']:.2f}",
+                        f"${row['total']:.2f}",
+                        row["forma_pago"],
+                    ),
+                )
+            self._ventas_total_var.set(f"Total del rango: ${running_total:.2f}")
+            self._ventas_summary_var.set(
+                f"Rango {self._ventas_desde_var.get()} → {self._ventas_hasta_var.get()}: "
+                f"{len(ventas)} ventas  |  ${running_total:.2f}"
+            )
+        else:
+            selected_date = self._selected_ventas_date()
+            for row in stock_app.get_ventas_hoy(self.conn, cash_date=selected_date):
+                running_total += float(row["total"])
+                self.ventas_table.insert(
+                    "", "end",
+                    values=(
+                        row["hora"],
+                        row["codigo"],
+                        row["nombre"],
+                        row["cantidad"],
+                        f"${row['precio_unit']:.2f}",
+                        f"${row['total']:.2f}",
+                        row["forma_pago"],
+                    ),
+                )
+            self._ventas_total_var.set(f"Total del día: ${running_total:.2f}")
+            self._update_ventas_summary()
 
     def _update_ventas_summary(self) -> None:
         selected_date = self._selected_ventas_date()
@@ -1293,13 +1338,9 @@ class StockGui(tk.Tk):
         )
 
     def _show_cierre_caja(self) -> None:
-        selected_date = self._selected_ventas_date()
-        summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
-        breakdown = stock_app.get_payment_breakdown(self.conn, cash_date=selected_date)
-
         top = tk.Toplevel(self)
         top.title("Cierre de caja")
-        top.geometry("440x420")
+        top.geometry("460x520")
         top.resizable(False, False)
         top.transient(self)
         top.grab_set()
@@ -1307,10 +1348,22 @@ class StockGui(tk.Tk):
         frame = ttk.Frame(top, padding=20)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="Cierre de caja", font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
+        if self._ventas_range_active:
+            desde = self._ventas_desde_var.get()
+            hasta = self._ventas_hasta_var.get()
+            summary = stock_app.get_range_summary(self.conn, desde, hasta)
+            breakdown = summary["breakdown"]
+            ttk.Label(frame, text="Cierre de rango", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+            ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
+            ttk.Label(frame, text=f"Desde: {desde}  —  Hasta: {hasta}").pack(anchor="w")
+        else:
+            selected_date = self._selected_ventas_date()
+            summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
+            breakdown = stock_app.get_payment_breakdown(self.conn, cash_date=selected_date)
+            ttk.Label(frame, text="Cierre de caja", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+            ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
+            ttk.Label(frame, text=f"Fecha: {summary['fecha']}").pack(anchor="w")
 
-        ttk.Label(frame, text=f"Fecha: {summary['fecha']}").pack(anchor="w")
         ttk.Label(
             frame, text=f"Ventas realizadas: {summary['count']}"
         ).pack(anchor="w", pady=(4, 0))
@@ -1319,6 +1372,18 @@ class StockGui(tk.Tk):
             text=f"Total recaudado: ${summary['total']:.2f}",
             font=("Segoe UI", 13, "bold"),
         ).pack(anchor="w", pady=(6, 0))
+
+        if summary.get("total_costo", 0) > 0:
+            ttk.Label(
+                frame, text=f"Costo total: ${summary['total_costo']:.2f}"
+            ).pack(anchor="w", pady=(2, 0))
+            ganancia = summary.get("ganancia_bruta", 0)
+            ttk.Label(
+                frame,
+                text=f"Ganancia bruta: ${ganancia:.2f}",
+                font=("Segoe UI", 11, "bold"),
+                foreground="#2a7a2a" if ganancia >= 0 else "#cc0000",
+            ).pack(anchor="w", pady=(2, 0))
 
         if breakdown:
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
@@ -1329,7 +1394,7 @@ class StockGui(tk.Tk):
                     text=f"  • {row['forma_pago']}: {row['cantidad']} venta(s) — ${row['total']:.2f}",
                 ).pack(anchor="w", pady=(2, 0))
 
-        if summary["top_products"]:
+        if summary.get("top_products"):
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(
                 frame, text="Productos más vendidos:", font=("Segoe UI", 10, "bold")
@@ -1342,7 +1407,7 @@ class StockGui(tk.Tk):
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
         ttk.Button(frame, text="Cerrar", command=top.destroy).pack(anchor="e")
-    self._center_dialog(top)
+        self._center_dialog(top)
 
     def _export_ventas_csv(self) -> None:
         filepath = filedialog.asksaveasfilename(
@@ -1458,7 +1523,7 @@ class StockGui(tk.Tk):
 
         ttk.Button(btn_frame, text="Generar PDF", command=_generar).pack(side="right", padx=(8, 0))
         ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
-    self._center_dialog(dialog)
+        self._center_dialog(dialog)
 
     # =========================================================================
     # Undo
@@ -1545,6 +1610,106 @@ class StockGui(tk.Tk):
         self.stock_minimo_var.set("")
         self.proveedor_var.set("")
         self.notas_var.set("")
+
+    def _show_ajuste_stock(self) -> None:
+        selected = self.products_table.selection()
+        if not selected:
+            messagebox.showerror("Seleccione un producto", "Elija un producto de la lista.")
+            return
+        codigo = self.products_table.item(selected[0], "values")[0]
+        try:
+            product = stock_app.get_product(self.conn, codigo)
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Ajustar stock")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Producto:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Label(frame, text=product["nombre"], style="Bold.TLabel").grid(
+            row=0, column=1, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(frame, text="Código:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Label(frame, text=product["codigo"]).grid(row=1, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(frame, text="Stock actual:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        ttk.Label(frame, text=str(product["stock"]), style="Bold.TLabel").grid(
+            row=2, column=1, sticky="w", pady=(0, 10)
+        )
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10)
+        )
+        ttk.Label(frame, text="Nuevo stock:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        nuevo_var = tk.StringVar(value=str(product["stock"]))
+        nuevo_entry = ttk.Entry(frame, textvariable=nuevo_var, width=12)
+        nuevo_entry.grid(row=4, column=1, sticky="w", pady=(0, 10))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=5, column=0, columnspan=2, sticky="e")
+
+        def _guardar() -> None:
+            try:
+                nuevo = parse_int(nuevo_var.get(), "stock")
+            except ValueError as exc:
+                messagebox.showerror("Valor inválido", str(exc), parent=dialog)
+                return
+            try:
+                anterior = stock_app.adjust_stock(self.conn, codigo, nuevo)
+            except stock_app.StockError as exc:
+                messagebox.showerror("Error", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            self.refresh_all()
+            self._set_status(
+                f"✓ Stock de '{product['nombre']}' ajustado: {anterior} → {nuevo}"
+            )
+
+        ttk.Button(btn_row, text="Guardar", command=_guardar).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_row, text="Cancelar", command=dialog.destroy).pack(side="right")
+        self._center_dialog(dialog)
+        nuevo_entry.focus_set()
+        nuevo_entry.selection_range(0, tk.END)
+
+    def _ventas_filtrar_rango(self) -> None:
+        desde = self._ventas_desde_var.get().strip()
+        hasta = self._ventas_hasta_var.get().strip()
+        if not desde or not hasta:
+            messagebox.showerror(
+                "Fechas requeridas",
+                "Ingresá ambas fechas en formato YYYY-MM-DD.",
+            )
+            return
+        try:
+            date.fromisoformat(desde)
+            date.fromisoformat(hasta)
+        except ValueError:
+            messagebox.showerror("Formato inválido", "Usá el formato YYYY-MM-DD.")
+            return
+        if desde > hasta:
+            messagebox.showerror("Rango inválido", "La fecha 'Desde' debe ser anterior a 'Hasta'.")
+            return
+        self._ventas_range_active = True
+        for btn in (self._nav_prev_btn, self._nav_next_btn, self._nav_today_btn):
+            btn.configure(state="disabled")
+        self._nav_date_entry.configure(state="disabled")
+        self.refresh_ventas()
+
+    def _ventas_limpiar_rango(self) -> None:
+        self._ventas_range_active = False
+        for btn in (self._nav_prev_btn, self._nav_next_btn, self._nav_today_btn):
+            btn.configure(state="normal")
+        self._nav_date_entry.configure(state="normal")
+        self._ventas_desde_var.set("")
+        self._ventas_hasta_var.set("")
+        self.refresh_ventas()
 
     # =========================================================================
     # Create / edit product
@@ -1794,13 +1959,10 @@ class StockGui(tk.Tk):
 
     def refresh_products(self) -> None:
         clear_table(self.products_table)
-        query = self.search_var.get().lower()
+        query = self.search_var.get().strip()
 
         rows_data = []
-        for row in stock_app.list_products(self.conn):
-            prov = (row["proveedor"] or "").lower()
-            if query and query not in row["codigo"].lower() and query not in row["nombre"].lower() and query not in prov:
-                continue
+        for row in stock_app.search_products(self.conn, query):
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
             margen = f"{((precio - costo) / precio * 100):.0f}%" if costo > 0 and precio > 0 else "-"
