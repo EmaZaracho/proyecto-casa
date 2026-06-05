@@ -1878,8 +1878,6 @@ class StockGui(tk.Tk):
             if not allow:
                 return
             try:
-                sale_date = date.today()
-                cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
                 total = stock_app.register_sale(
                     self.conn, codigo, cantidad, allow_negative=True,
                     sale_date=sale_date, forma_pago=forma_pago,
@@ -1965,7 +1963,7 @@ class StockGui(tk.Tk):
         for row in stock_app.search_products(self.conn, query):
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
-            margen = f"{((precio - costo) / precio * 100):.0f}%" if costo > 0 and precio > 0 else "-"
+            margen = _calc_margen(precio, costo)
             if row["stock"] <= 0:
                 tag = "stock_critical"
             elif row["stock"] < row["stock_minimo"]:
@@ -2028,22 +2026,13 @@ class StockGui(tk.Tk):
 
     def refresh_price_table(self) -> None:
         clear_table(self.price_table)
+        text_filter = self.price_search_var.get().strip()
         prov_filter = self.price_proveedor_var.get().strip().lower()
-        text_filter = self.price_search_var.get().strip().lower()
-        for row in stock_app.list_products(self.conn):
+        for row in stock_app.search_products(self.conn, text_filter):
             if prov_filter and prov_filter not in (row["proveedor"] or "").lower():
-                continue
-            if text_filter and (
-                text_filter not in row["codigo"].lower()
-                and text_filter not in row["nombre"].lower()
-            ):
                 continue
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
-            if costo > 0 and precio > 0:
-                margen = f"{((precio - costo) / precio * 100):.0f}%"
-            else:
-                margen = "-"
             self.price_table.insert(
                 "", "end",
                 values=(
@@ -2051,7 +2040,7 @@ class StockGui(tk.Tk):
                     row["nombre"],
                     f"${precio:.2f}",
                     f"${costo:.2f}" if costo > 0 else "-",
-                    margen,
+                    _calc_margen(precio, costo),
                     row["proveedor"] or "-",
                 ),
             )
@@ -2142,6 +2131,12 @@ class StockGui(tk.Tk):
 def clear_table(table: ttk.Treeview) -> None:
     for item in table.get_children():
         table.delete(item)
+
+
+def _calc_margen(precio: float, costo: float) -> str:
+    if costo > 0 and precio > 0:
+        return f"{((precio - costo) / precio * 100):.0f}%"
+    return "-"
 
 
 def parse_float(value: str, field_name: str) -> float:

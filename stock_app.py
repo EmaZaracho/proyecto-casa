@@ -300,10 +300,13 @@ def adjust_stock(conn: sqlite3.Connection, codigo: str, nuevo_stock: int) -> int
     if row is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
     stock_anterior = int(row["stock"])
-    conn.execute(
-        "UPDATE productos SET stock = ? WHERE codigo = ?", (nuevo_stock, codigo.strip())
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            "UPDATE productos SET stock = ? WHERE codigo = ?", (nuevo_stock, codigo.strip())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        raise StockError(f"No se pudo ajustar el stock: {exc}") from exc
     return stock_anterior
 
 
