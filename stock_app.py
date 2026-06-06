@@ -57,7 +57,7 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -162,6 +162,50 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         if not _col_exists("ventas", "precio_costo"):
             conn.execute("ALTER TABLE ventas ADD COLUMN precio_costo REAL NOT NULL DEFAULT 0")
 
+    # v3 -> v4: indexes for common searches and reports
+    if current_version < 4:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_productos_nombre ON productos(nombre)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_productos_proveedor ON productos(proveedor)")
+
+    # v4 -> v5: multiple suppliers per product, keeping productos as active supplier cache
+    if current_version < 5:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proveedores_producto (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codigo TEXT NOT NULL REFERENCES productos(codigo) ON DELETE CASCADE,
+                proveedor TEXT NOT NULL,
+                precio_costo REAL NOT NULL CHECK(precio_costo >= 0),
+                es_principal INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        rows = conn.execute(
+            """
+            SELECT codigo, proveedor, precio_costo
+            FROM productos
+            WHERE proveedor != '' AND precio_costo > 0
+            """
+        ).fetchall()
+        for row in rows:
+            exists = conn.execute(
+                """
+                SELECT 1 FROM proveedores_producto
+                WHERE codigo = ? AND proveedor = ? AND es_principal = 1
+                """,
+                (row["codigo"], row["proveedor"]),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO proveedores_producto
+                        (codigo, proveedor, precio_costo, es_principal)
+                    VALUES (?, ?, ?, 1)
+                    """,
+                    (row["codigo"], row["proveedor"], row["precio_costo"]),
+                )
+
     # update stored version
     if current_version == 0:
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
@@ -193,16 +237,26 @@ def add_product(
         raise DuplicateProductError(f"Ya existe un producto con codigo {codigo}.")
 
     try:
-        conn.execute(
-            """
-            INSERT INTO productos
-                (codigo, nombre, precio, stock, stock_minimo, proveedor, precio_costo, notas)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (codigo, nombre, precio, stock, stock_minimo,
-             proveedor.strip(), precio_costo, notas.strip()),
-        )
-        conn.commit()
+        proveedor = proveedor.strip()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO productos
+                    (codigo, nombre, precio, stock, stock_minimo, proveedor, precio_costo, notas)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (codigo, nombre, precio, stock, stock_minimo,
+                 proveedor, precio_costo, notas.strip()),
+            )
+            if proveedor and precio_costo > 0:
+                conn.execute(
+                    """
+                    INSERT INTO proveedores_producto
+                        (codigo, proveedor, precio_costo, es_principal)
+                    VALUES (?, ?, ?, 1)
+                    """,
+                    (codigo, proveedor, float(precio_costo)),
+                )
     except sqlite3.IntegrityError as exc:
         raise StockError(f"No se pudo registrar el producto: {exc}") from exc
 
@@ -235,6 +289,31 @@ def update_product(
             (nombre, precio, stock, stock_minimo,
              proveedor.strip(), precio_costo, notas.strip(), codigo),
         )
+        primary = conn.execute(
+            """
+            SELECT id FROM proveedores_producto
+            WHERE codigo = ? AND es_principal = 1
+            """,
+            (codigo,),
+        ).fetchone()
+        if primary:
+            conn.execute(
+                """
+                UPDATE proveedores_producto
+                SET proveedor = ?, precio_costo = ?
+                WHERE id = ?
+                """,
+                (proveedor.strip(), float(precio_costo), primary["id"]),
+            )
+        elif proveedor.strip() and precio_costo > 0:
+            conn.execute(
+                """
+                INSERT INTO proveedores_producto
+                    (codigo, proveedor, precio_costo, es_principal)
+                VALUES (?, ?, ?, 1)
+                """,
+                (codigo, proveedor.strip(), float(precio_costo)),
+            )
         if float(row["precio"]) != precio:
             log_price_change(conn, codigo, nombre, float(row["precio"]), precio, "Edición manual")
         conn.commit()
@@ -292,6 +371,21 @@ def search_products(conn: sqlite3.Connection, query: str = "") -> list[sqlite3.R
     ).fetchall()
 
 
+def get_products_preview(conn: sqlite3.Connection, codigos: list[str]) -> list[sqlite3.Row]:
+    if not codigos:
+        return []
+    placeholders = ",".join("?" for _ in codigos)
+    return conn.execute(
+        f"""
+        SELECT codigo, nombre, precio
+        FROM productos
+        WHERE codigo IN ({placeholders})
+        ORDER BY nombre
+        """,
+        codigos,
+    ).fetchall()
+
+
 def adjust_stock(conn: sqlite3.Connection, codigo: str, nuevo_stock: int) -> int:
     """Sets the product stock to nuevo_stock. Returns the previous stock value."""
     row = conn.execute(
@@ -322,6 +416,105 @@ def get_all_proveedores(conn: sqlite3.Connection) -> list[str]:
         "SELECT DISTINCT proveedor FROM productos WHERE proveedor != '' ORDER BY proveedor"
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def get_product_suppliers(conn: sqlite3.Connection, codigo: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, codigo, proveedor, precio_costo, es_principal
+        FROM proveedores_producto
+        WHERE codigo = ?
+        ORDER BY es_principal DESC, proveedor ASC, id ASC
+        """,
+        (codigo.strip(),),
+    ).fetchall()
+
+
+def add_product_supplier(
+    conn: sqlite3.Connection,
+    codigo: str,
+    proveedor: str,
+    precio_costo: float,
+) -> None:
+    codigo = codigo.strip()
+    proveedor = proveedor.strip()
+    if not proveedor:
+        raise ValueError("El proveedor es obligatorio.")
+    if precio_costo < 0:
+        raise ValueError("El precio de costo no puede ser negativo.")
+    if conn.execute("SELECT 1 FROM productos WHERE codigo = ?", (codigo,)).fetchone() is None:
+        raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
+    with conn:
+        has_primary = conn.execute(
+            """
+            SELECT 1 FROM proveedores_producto
+            WHERE codigo = ? AND es_principal = 1
+            """,
+            (codigo,),
+        ).fetchone()
+        is_primary = 0 if has_primary else 1
+        conn.execute(
+            """
+            INSERT INTO proveedores_producto (codigo, proveedor, precio_costo, es_principal)
+            VALUES (?, ?, ?, ?)
+            """,
+            (codigo, proveedor, float(precio_costo), is_primary),
+        )
+        if is_primary:
+            conn.execute(
+                "UPDATE productos SET proveedor = ?, precio_costo = ? WHERE codigo = ?",
+                (proveedor, float(precio_costo), codigo),
+            )
+
+
+def set_primary_supplier(conn: sqlite3.Connection, supplier_id: int, codigo: str) -> None:
+    codigo = codigo.strip()
+    row = conn.execute(
+        """
+        SELECT id, proveedor, precio_costo
+        FROM proveedores_producto
+        WHERE id = ? AND codigo = ?
+        """,
+        (supplier_id, codigo),
+    ).fetchone()
+    if row is None:
+        raise StockError("No existe ese proveedor para el producto.")
+    with conn:
+        conn.execute(
+            "UPDATE proveedores_producto SET es_principal = 0 WHERE codigo = ?",
+            (codigo,),
+        )
+        conn.execute(
+            "UPDATE proveedores_producto SET es_principal = 1 WHERE id = ?",
+            (supplier_id,),
+        )
+        conn.execute(
+            "UPDATE productos SET proveedor = ?, precio_costo = ? WHERE codigo = ?",
+            (row["proveedor"], float(row["precio_costo"]), codigo),
+        )
+
+
+def remove_product_supplier(conn: sqlite3.Connection, supplier_id: int) -> None:
+    row = conn.execute(
+        """
+        SELECT id, codigo, es_principal
+        FROM proveedores_producto
+        WHERE id = ?
+        """,
+        (supplier_id,),
+    ).fetchone()
+    if row is None:
+        raise StockError("No existe ese proveedor.")
+    count = conn.execute(
+        "SELECT COUNT(*) FROM proveedores_producto WHERE codigo = ?",
+        (row["codigo"],),
+    ).fetchone()[0]
+    if count <= 1:
+        raise StockError("No se puede eliminar el unico proveedor del producto.")
+    if int(row["es_principal"]):
+        raise StockError("No se puede eliminar el proveedor principal.")
+    with conn:
+        conn.execute("DELETE FROM proveedores_producto WHERE id = ?", (supplier_id,))
 
 
 def low_stock_products(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -359,6 +552,31 @@ def get_price_history(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def search_price_history(conn: sqlite3.Connection, query: str = "") -> list[sqlite3.Row]:
+    q = query.strip().lower()
+    if not q:
+        return get_price_history(conn)
+    like = f"%{q}%"
+    return conn.execute(
+        """
+        SELECT *
+        FROM historial_precios
+        WHERE lower(codigo) LIKE ? OR lower(nombre) LIKE ?
+        ORDER BY id DESC
+        """,
+        (like, like),
+    ).fetchall()
+
+
+def restore_prices(conn: sqlite3.Connection, changes: list[tuple[str, float, float]]) -> None:
+    with conn:
+        for codigo, old_price, _ in changes:
+            conn.execute(
+                "UPDATE productos SET precio = ? WHERE codigo = ?",
+                (old_price, codigo),
+            )
+
+
 def bulk_price_increase(
     conn: sqlite3.Connection,
     codigos: list[str],
@@ -385,7 +603,7 @@ def register_sale(
     allow_negative: bool = False,
     sale_date: date | None = None,
     forma_pago: str = "Efectivo",
-) -> float:
+) -> tuple[float, int]:
     if cantidad <= 0:
         raise ValueError("La cantidad debe ser mayor a cero.")
 
@@ -415,7 +633,7 @@ def register_sale(
             """,
             (sale_day, total),
         )
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO ventas
                 (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo)
@@ -424,7 +642,8 @@ def register_sale(
             (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
              total, sale_day, sale_hour, forma_pago, float(product["precio_costo"])),
         )
-    return total
+        sale_id = int(cursor.lastrowid)
+    return total, sale_id
 
 
 def reverse_sale(
@@ -433,6 +652,7 @@ def reverse_sale(
     cantidad: int,
     total: float,
     sale_date: str,
+    sale_id: int | None = None,
 ) -> None:
     """Reverts a registered sale: restores stock, subtracts total from daily cash, removes venta row."""
     with conn:
@@ -444,16 +664,19 @@ def reverse_sale(
             "UPDATE caja SET total = CASE WHEN total - ? < 0 THEN 0 ELSE total - ? END WHERE fecha = ?",
             (total, total, sale_date),
         )
-        conn.execute(
-            """
-            DELETE FROM ventas WHERE id = (
-                SELECT id FROM ventas
-                WHERE codigo = ? AND total = ? AND fecha = ?
-                ORDER BY id DESC LIMIT 1
+        if sale_id is not None:
+            conn.execute("DELETE FROM ventas WHERE id = ?", (sale_id,))
+        else:
+            conn.execute(
+                """
+                DELETE FROM ventas WHERE id = (
+                    SELECT id FROM ventas
+                    WHERE codigo = ? AND total = ? AND fecha = ?
+                    ORDER BY id DESC LIMIT 1
+                )
+                """,
+                (codigo.strip(), total, sale_date),
             )
-            """,
-            (codigo.strip(), total, sale_date),
-        )
 
 
 def add_pending(conn: sqlite3.Connection, descripcion: str) -> None:
@@ -678,13 +901,13 @@ def sale_flow(conn: sqlite3.Connection) -> None:
     codigo = read_text("Codigo de barras: ")
     cantidad = read_int("Cantidad vendida: ")
     try:
-        total = register_sale(conn, codigo, cantidad)
+        total, _sale_id = register_sale(conn, codigo, cantidad)
         print(f"Venta registrada. Total: ${total:.2f}")
     except InsufficientStockError as exc:
         print(exc)
         answer = read_text("Autorizar stock negativo? (s/n): ").lower()
         if answer == "s":
-            total = register_sale(conn, codigo, cantidad, allow_negative=True)
+            total, _sale_id = register_sale(conn, codigo, cantidad, allow_negative=True)
             print(f"Venta registrada con stock negativo. Total: ${total:.2f}")
     except (ProductNotFoundError, ValueError) as exc:
         print(exc)

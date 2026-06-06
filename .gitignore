@@ -6,3 +6,5 @@ stock.log
 fotos_productos/
 backups/
 config.json
+dist/
+build/

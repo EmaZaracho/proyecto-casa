@@ -76,12 +76,13 @@ class StockAppTests(unittest.TestCase):
 
     def test_sale_updates_stock_and_daily_cash(self):
         stock_app.add_product(self.conn, "779003", "Arroz", 1000, 5, 1)
-        total = stock_app.register_sale(self.conn, "779003", 2, sale_date=date(2026, 5, 23))
+        total, sale_id = stock_app.register_sale(self.conn, "779003", 2, sale_date=date(2026, 5, 23))
         product = stock_app.get_product(self.conn, "779003")
         cash = self.conn.execute(
             "SELECT total FROM caja WHERE fecha = '2026-05-23'"
         ).fetchone()
         self.assertEqual(total, 2000)
+        self.assertIsInstance(sale_id, int)
         self.assertEqual(product["stock"], 3)
         self.assertEqual(cash["total"], 2000)
 
@@ -100,7 +101,7 @@ class StockAppTests(unittest.TestCase):
         stock_app.add_product(self.conn, "779004", "Aceite", 3000, 1, 1)
         with self.assertRaises(stock_app.InsufficientStockError):
             stock_app.register_sale(self.conn, "779004", 2)
-        total = stock_app.register_sale(self.conn, "779004", 2, allow_negative=True)
+        total, _sale_id = stock_app.register_sale(self.conn, "779004", 2, allow_negative=True)
         product = stock_app.get_product(self.conn, "779004")
         self.assertEqual(total, 6000)
         self.assertEqual(product["stock"], -1)
@@ -120,9 +121,9 @@ class StockAppTests(unittest.TestCase):
 
     def test_reverse_sale_deletes_venta_record(self):
         stock_app.add_product(self.conn, "REV03", "Queso", 800, 5, 1)
-        stock_app.register_sale(self.conn, "REV03", 2, sale_date=date(2026, 5, 5))
+        _total, sale_id = stock_app.register_sale(self.conn, "REV03", 2, sale_date=date(2026, 5, 5))
         total = 1600.0
-        stock_app.reverse_sale(self.conn, "REV03", 2, total, "2026-05-05")
+        stock_app.reverse_sale(self.conn, "REV03", 2, total, "2026-05-05", sale_id=sale_id)
         ventas = self.conn.execute(
             "SELECT * FROM ventas WHERE codigo = 'REV03'"
         ).fetchall()
@@ -143,10 +144,10 @@ class StockAppTests(unittest.TestCase):
     def test_get_ventas_hoy_returns_todays_sales(self):
         stock_app.add_product(self.conn, "GVH01", "Aceite", 1000, 5, 0)
         stock_app.add_product(self.conn, "GVH02", "Sal", 200, 10, 0)
-        today = date.today()
+        today = date(2026, 1, 15)
         stock_app.register_sale(self.conn, "GVH01", 2, sale_date=today)
         stock_app.register_sale(self.conn, "GVH02", 1, sale_date=today)
-        ventas = stock_app.get_ventas_hoy(self.conn)
+        ventas = stock_app.get_ventas_hoy(self.conn, cash_date=today)
         self.assertEqual(len(ventas), 2)
 
     def test_get_ventas_hoy_excludes_other_dates(self):
@@ -157,10 +158,10 @@ class StockAppTests(unittest.TestCase):
 
     def test_get_daily_summary_totals(self):
         stock_app.add_product(self.conn, "GDS01", "Café", 500, 5, 0)
-        today = date.today()
+        today = date(2026, 1, 15)
         stock_app.register_sale(self.conn, "GDS01", 2, sale_date=today)
         stock_app.register_sale(self.conn, "GDS01", 1, sale_date=today)
-        summary = stock_app.get_daily_summary(self.conn)
+        summary = stock_app.get_daily_summary(self.conn, cash_date=today)
         self.assertEqual(summary["count"], 2)
         self.assertEqual(summary["total"], 1500.0)
 
@@ -328,13 +329,138 @@ class StockAppTests(unittest.TestCase):
 
     def test_export_ventas_csv_creates_file(self):
         stock_app.add_product(self.conn, "EXV01", "Vendible", 500, 10, 0)
-        today = date.today()
+        today = date(2026, 1, 15)
         stock_app.register_sale(self.conn, "EXV01", 2, sale_date=today)
         dest = Path(self.tmp.name) / "ventas.csv"
-        n = stock_app.export_ventas_csv(self.conn, dest)
+        n = stock_app.export_ventas_csv(self.conn, dest, cash_date=today)
         self.assertEqual(n, 1)
         content = dest.read_text(encoding="utf-8-sig")
         self.assertIn("EXV01", content)
+
+    # -- search / history / config helpers -------------------------------------
+
+    def test_search_products_filters_by_name(self):
+        stock_app.add_product(self.conn, "S01", "Coca Cola", 1000, 5, 1)
+        stock_app.add_product(self.conn, "S02", "Agua", 500, 5, 1)
+        rows = stock_app.search_products(self.conn, "coca")
+        self.assertEqual([row["codigo"] for row in rows], ["S01"])
+
+    def test_search_products_filters_by_proveedor(self):
+        stock_app.add_product(self.conn, "SP01", "Yerba", 1000, 5, 1, proveedor="Norte")
+        stock_app.add_product(self.conn, "SP02", "Azucar", 800, 5, 1, proveedor="Sur")
+        rows = stock_app.search_products(self.conn, "nor")
+        self.assertEqual([row["codigo"] for row in rows], ["SP01"])
+
+    def test_adjust_stock_returns_previous(self):
+        stock_app.add_product(self.conn, "AS01", "Fideos", 700, 8, 1)
+        previous = stock_app.adjust_stock(self.conn, "AS01", 3)
+        self.assertEqual(previous, 8)
+        self.assertEqual(stock_app.get_product(self.conn, "AS01")["stock"], 3)
+
+    def test_log_price_change_creates_record(self):
+        with self.conn:
+            stock_app.log_price_change(self.conn, "LP01", "Leche", 100, 120, "Test")
+        rows = stock_app.get_price_history(self.conn)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["codigo"], "LP01")
+
+    def test_get_price_history_returns_records(self):
+        with self.conn:
+            stock_app.log_price_change(self.conn, "H01", "A", 100, 110, "Uno")
+            stock_app.log_price_change(self.conn, "H02", "B", 200, 220, "Dos")
+        rows = stock_app.get_price_history(self.conn)
+        self.assertEqual([row["codigo"] for row in rows], ["H02", "H01"])
+
+    def test_search_price_history_filters_in_sql(self):
+        with self.conn:
+            stock_app.log_price_change(self.conn, "H03", "Coca", 100, 110, "Uno")
+            stock_app.log_price_change(self.conn, "H04", "Agua", 200, 220, "Dos")
+        rows = stock_app.search_price_history(self.conn, "coca")
+        self.assertEqual([row["codigo"] for row in rows], ["H03"])
+
+    def test_complete_pending_changes_estado(self):
+        stock_app.add_pending(self.conn, "Completar")
+        pending_id = stock_app.list_pending(self.conn)[0]["id"]
+        self.assertTrue(stock_app.complete_pending(self.conn, pending_id))
+        row = self.conn.execute("SELECT estado FROM pendientes WHERE id = ?", (pending_id,)).fetchone()
+        self.assertEqual(row["estado"], "Completado")
+
+    def test_load_config_returns_defaults_if_missing(self):
+        missing = Path(self.tmp.name) / "missing_config.json"
+        with patch.object(stock_app, "CONFIG_PATH", missing):
+            config = stock_app.load_config()
+        self.assertIn("nombre_negocio", config)
+        self.assertIn("moneda", config)
+
+    def test_get_products_preview_returns_subset(self):
+        stock_app.add_product(self.conn, "PV01", "Uno", 100, 1, 0)
+        stock_app.add_product(self.conn, "PV02", "Dos", 200, 1, 0)
+        rows = stock_app.get_products_preview(self.conn, ["PV02"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["codigo"], "PV02")
+
+    def test_restore_prices_restores_previous_values(self):
+        stock_app.add_product(self.conn, "RP01", "Precio", 100, 1, 0)
+        stock_app.restore_prices(self.conn, [("RP01", 80.0, 100.0)])
+        self.assertEqual(stock_app.get_product(self.conn, "RP01")["precio"], 80.0)
+
+    # -- multi supplier ---------------------------------------------------------
+
+    def test_add_product_supplier_creates_record(self):
+        stock_app.add_product(self.conn, "MS01", "Producto", 100, 1, 0)
+        stock_app.add_product_supplier(self.conn, "MS01", "Proveedor A", 60)
+        rows = stock_app.get_product_suppliers(self.conn, "MS01")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["proveedor"], "Proveedor A")
+        self.assertEqual(rows[0]["es_principal"], 1)
+
+    def test_set_primary_supplier_updates_producto(self):
+        stock_app.add_product(self.conn, "MS02", "Producto", 100, 1, 0)
+        stock_app.add_product_supplier(self.conn, "MS02", "Proveedor A", 60)
+        stock_app.add_product_supplier(self.conn, "MS02", "Proveedor B", 55)
+        supplier_b = [
+            row for row in stock_app.get_product_suppliers(self.conn, "MS02")
+            if row["proveedor"] == "Proveedor B"
+        ][0]
+        stock_app.set_primary_supplier(self.conn, supplier_b["id"], "MS02")
+        product = stock_app.get_product(self.conn, "MS02")
+        self.assertEqual(product["proveedor"], "Proveedor B")
+        self.assertEqual(product["precio_costo"], 55.0)
+
+    def test_remove_supplier_not_last(self):
+        stock_app.add_product(self.conn, "MS03", "Producto", 100, 1, 0)
+        stock_app.add_product_supplier(self.conn, "MS03", "Proveedor A", 60)
+        stock_app.add_product_supplier(self.conn, "MS03", "Proveedor B", 55)
+        supplier_b = [
+            row for row in stock_app.get_product_suppliers(self.conn, "MS03")
+            if row["proveedor"] == "Proveedor B"
+        ][0]
+        stock_app.remove_product_supplier(self.conn, supplier_b["id"])
+        rows = stock_app.get_product_suppliers(self.conn, "MS03")
+        self.assertEqual([row["proveedor"] for row in rows], ["Proveedor A"])
+
+    def test_migration_v4_to_v5_preserves_existing_supplier(self):
+        db_path = Path(self.tmp.name) / "migration_v4.db"
+        conn = stock_app.get_connection(db_path)
+        try:
+            stock_app.initialize_database(conn)
+            conn.execute("UPDATE schema_version SET version = 4")
+            conn.execute(
+                """
+                INSERT INTO productos
+                    (codigo, nombre, precio, stock, stock_minimo, proveedor, precio_costo, notas)
+                VALUES ('MIG01', 'Migrado', 100, 1, 0, 'Viejo', 70, '')
+                """
+            )
+            conn.execute("DELETE FROM proveedores_producto")
+            conn.commit()
+            stock_app.initialize_database(conn)
+            rows = stock_app.get_product_suppliers(conn, "MIG01")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["proveedor"], "Viejo")
+            self.assertEqual(rows[0]["es_principal"], 1)
+        finally:
+            conn.close()
 
 
 # =============================================================================

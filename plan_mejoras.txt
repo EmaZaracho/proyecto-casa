@@ -1,0 +1,408 @@
+PLAN DE MEJORAS — Sistema de Stock
+====================================
+Fecha: 2026-06-06
+
+CONTEXTO
+--------
+Análisis completo del proyecto reveló bugs que pueden corromper datos,
+violaciones de arquitectura (SQL directo en GUI), y un estado de despliegue
+inviable para usuario no técnico (bat sin manejo de errores, sin .exe,
+sin requirements.txt). Este plan cubre: bugs críticos, mejoras medias de
+UX y rendimiento, soporte multi-proveedor y empaquetado como ejecutable
+para Windows.
+
+
+======================================================================
+FASE A — BUGS CRÍTICOS
+======================================================================
+
+A1. register_sale() debe retornar el sale_id [stock_app.py ~L427]
+------------------------------------------------------------------
+Actualmente retorna float (el total). El undo necesita el ID real de
+la venta para revertir sin ambigüedad. Si dos ventas del mismo producto
+tienen el mismo monto en el mismo día, el undo puede borrar la venta
+equivocada.
+
+Cambio:
+  - Signature: def register_sale(...) -> tuple[float, int]
+  - Capturar cursor.lastrowid después del INSERT en ventas
+  - Retornar (total, sale_id)
+
+
+A2. reverse_sale() acepta sale_id opcional [stock_app.py ~L430]
+---------------------------------------------------------------
+Cuando se pasa sale_id, el DELETE usa WHERE id = ? en lugar del lookup
+por (codigo, total, fecha) que es ambiguo.
+
+Cambio en signature:
+  def reverse_sale(conn, codigo, cantidad, total, sale_date, sale_id: int | None = None)
+
+Lógica:
+  if sale_id is not None:
+      DELETE FROM ventas WHERE id = ?
+  else:
+      DELETE FROM ventas WHERE id = (SELECT id FROM ventas WHERE ... LIMIT 1)
+      [fallback para compatibilidad con tests existentes]
+
+
+A3. _cobrar_carrito() guarda sale_id en el stack de undo [stock_gui.py ~L1163]
+------------------------------------------------------------------------------
+  total, sale_id = stock_app.register_sale(...)
+  processed.append({**item, "total": total, "sale_id": sale_id, ...})
+
+El undo entry incluye "sale_id": item["sale_id"].
+
+
+A4. _undo() pasa sale_id a reverse_sale [stock_gui.py ~L1550]
+-------------------------------------------------------------
+  stock_app.reverse_sale(
+      self.conn, action["codigo"], action["cantidad"],
+      action["total"], action["sale_date"],
+      sale_id=action.get("sale_id"),
+  )
+
+
+A5. Mover SQL de preview de precios a stock_app [stock_gui.py ~L1236]
+----------------------------------------------------------------------
+El método _apply_price_increase() ejecuta SQL directo para obtener
+los nombres/precios de muestra. Eso es una violación de arquitectura.
+
+Nueva función en stock_app.py:
+  def get_products_preview(conn, codigos: list[str]) -> list[sqlite3.Row]:
+      placeholders = ",".join("?" for _ in codigos)
+      return conn.execute(
+          "SELECT codigo, nombre, precio FROM productos WHERE codigo IN (...)",
+          codigos
+      ).fetchall()
+
+En _apply_price_increase() reemplazar líneas 1236-1244 por:
+  sample = stock_app.get_products_preview(self.conn, codigos[:3])
+
+
+A6. Mover SQL de undo de aumento a stock_app [stock_gui.py ~L1558]
+------------------------------------------------------------------
+El bloque "price_increase" en _undo() ejecuta SQL directo.
+
+Nueva función en stock_app.py:
+  def restore_prices(conn, changes: list[tuple[str, float, float]]) -> None:
+      with conn:
+          for codigo, old_price, _ in changes:
+              conn.execute("UPDATE productos SET precio = ? WHERE codigo = ?",
+                           (old_price, codigo))
+
+En _undo() reemplazar el bloque price_increase por:
+  stock_app.restore_prices(self.conn, action["changes"])
+
+
+======================================================================
+FASE B — MEJORAS MEDIAS DE UX Y RENDIMIENTO
+======================================================================
+
+B1. Confirmación antes de vaciar carrito [stock_gui.py ~L1141]
+--------------------------------------------------------------
+Actualmente _clear_cart() vacía el carrito sin pedir confirmación.
+Solo tiene undo como fallback.
+
+Agregar antes de limpiar:
+  if not messagebox.askyesno("Vaciar carrito",
+                              f"¿Eliminar {len(self._cart)} producto(s)?"):
+      return
+
+
+B2. Filtrado SQL en historial de precios [stock_app.py + stock_gui.py]
+----------------------------------------------------------------------
+_refresh_price_history() trae TODOS los registros de la DB y filtra
+en Python. Con mucho historial, esto congela la UI.
+
+Nueva función en stock_app.py:
+  def search_price_history(conn, query: str = "") -> list[sqlite3.Row]:
+      q = f"%{query.strip()}%"
+      return conn.execute(
+          "SELECT * FROM historial_precios "
+          "WHERE codigo LIKE ? OR nombre LIKE ? ORDER BY id DESC",
+          (q, q)
+      ).fetchall()
+
+En _refresh_price_history() reemplazar fetch-all + filtro Python por:
+  query = self._price_hist_search_var.get()
+  rows = stock_app.search_price_history(self.conn, query)
+
+
+B3. Alineación de columnas numéricas en tablas [stock_gui.py]
+-------------------------------------------------------------
+Las columnas numéricas deben usar anchor="e" (east = derecha).
+Aplicar en: products_table, price_table, ventas_table.
+
+Columnas a la DERECHA: Precio, Precio costo, Margen, Stock, Stock mín.,
+                        Cantidad, Subtotal, Total.
+Columnas a la IZQUIERDA: Codigo, Nombre, Proveedor, Hora, Forma de pago,
+                          Motivo.
+
+En cada columna:
+  tree.column("Precio", anchor="e")
+  tree.heading("Precio", anchor="e")
+
+
+B4. Schema v4: índices en ventas y productos [stock_app.py]
+-----------------------------------------------------------
+Sin índices, cada búsqueda y cada reporte hace un table scan completo.
+
+Migración v3 → v4 en initialize_database():
+  if current_version < 4:
+      conn.execute("CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)")
+      conn.execute("CREATE INDEX IF NOT EXISTS idx_productos_nombre ON productos(nombre)")
+      conn.execute("CREATE INDEX IF NOT EXISTS idx_productos_proveedor ON productos(proveedor)")
+      _set_version(conn, 4)
+
+Actualizar _SCHEMA_VERSION = 4.
+
+
+======================================================================
+FASE C — TESTS
+======================================================================
+
+C1. Corregir 3 tests frágiles con date.today()
+----------------------------------------------
+Archivos: test_stock_app.py líneas ~146, ~160, ~331.
+Problema: si el test se corre cerca de la medianoche puede fallar.
+
+Reemplazar date.today() por fecha fija: date(2026, 1, 15)
+
+
+C2. Agregar tests para funciones sin cobertura
+----------------------------------------------
+En StockAppTests, agregar:
+
+  test_search_products_filters_by_name()
+    → verifica que search_products("coca") retorna solo productos con
+      "coca" en el nombre
+
+  test_search_products_filters_by_proveedor()
+    → verifica filtro por proveedor vía SQL LIKE
+
+  test_adjust_stock_returns_previous()
+    → adjust_stock() debe retornar el stock anterior al ajuste
+
+  test_log_price_change_creates_record()
+    → log_price_change() dentro de transacción manual crea registro
+      recuperable por get_price_history()
+
+  test_get_price_history_returns_records()
+    → get_price_history() retorna registros en orden correcto
+
+  test_complete_pending_changes_estado()
+    → complete_pending() cambia estado de "Pendiente" a "Completado"
+
+  test_load_config_returns_defaults_if_missing()
+    → load_config() sin archivo retorna dict con keys nombre_negocio y moneda
+
+  test_get_products_preview_returns_subset()
+    → nueva función A5 retorna solo los codigos solicitados
+
+
+======================================================================
+FASE D — DESPLIEGUE PARA USUARIO NO TÉCNICO
+======================================================================
+
+D1. requirements.txt (nuevo archivo en raíz del proyecto)
+----------------------------------------------------------
+  fpdf2>=2.7.0
+
+
+D2. iniciar_gui.bat mejorado
+----------------------------
+  @echo off
+  setlocal enabledelayedexpansion
+  cd /d "%~dp0"
+
+  python --version >nul 2>&1
+  if %errorlevel% neq 0 (
+      echo ERROR: Python no encontrado.
+      echo Instalar desde https://www.python.org/downloads/
+      pause & exit /b 1
+  )
+
+  if not exist stock_gui.py (
+      echo ERROR: No se encontro stock_gui.py en %cd%
+      pause & exit /b 1
+  )
+
+  if exist .venv\Scripts\activate.bat (
+      call .venv\Scripts\activate.bat
+  )
+
+  python stock_gui.py
+  if %errorlevel% neq 0 (
+      echo.
+      echo La aplicacion cerro con un error. Revisar stock.log para detalles.
+      pause
+  )
+
+
+D3. setup.bat (nuevo archivo) — se corre una sola vez en el equipo destino
+--------------------------------------------------------------------------
+  @echo off
+  cd /d "%~dp0"
+  echo Configurando entorno...
+  python -m venv .venv
+  call .venv\Scripts\activate.bat
+  python -m pip install --upgrade pip
+  pip install -r requirements.txt
+  echo.
+  echo Listo. Ejecutar iniciar_gui.bat para iniciar.
+  pause
+
+
+D4. build.bat + stock.spec — empaquetado con PyInstaller
+---------------------------------------------------------
+Genera un único SistemaDeStock.exe que no requiere Python instalado.
+
+build.bat:
+  @echo off
+  cd /d "%~dp0"
+  call .venv\Scripts\activate.bat
+  pip install pyinstaller
+  pyinstaller stock.spec
+  echo Ejecutable generado en dist\SistemaDeStock.exe
+  pause
+
+stock.spec (esquema):
+  a = Analysis(
+      ['stock_gui.py'],
+      hiddenimports=['fpdf2'],
+      ...
+  )
+  exe = EXE(..., name='SistemaDeStock', windowed=True, onefile=True)
+
+NOTA: stock.db y config.json se generan en la misma carpeta que el .exe
+en runtime. El usuario solo hace doble clic.
+
+
+D5. Agregar a .gitignore
+------------------------
+  dist/
+  build/
+  *.spec  (si se genera automáticamente)
+
+
+======================================================================
+FASE E — SOPORTE MULTI-PROVEEDOR POR PRODUCTO
+======================================================================
+
+DISEÑO GENERAL
+--------------
+Un producto puede tener N proveedores, cada uno con su propio
+precio_costo. El proveedor "principal" es el que se usa en cálculos
+de margen y en el registro de ventas.
+
+productos.proveedor y productos.precio_costo se mantienen como
+"proveedor activo" — sin cambiar el contrato de register_sale().
+El cambio es 100% aditivo: nada de la lógica existente se rompe.
+
+
+E1. Nueva tabla proveedores_producto (schema v5)
+------------------------------------------------
+  CREATE TABLE IF NOT EXISTS proveedores_producto (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      codigo       TEXT    NOT NULL REFERENCES productos(codigo)
+                           ON DELETE CASCADE,
+      proveedor    TEXT    NOT NULL,
+      precio_costo REAL    NOT NULL CHECK(precio_costo >= 0),
+      es_principal INTEGER NOT NULL DEFAULT 0  -- 1 = proveedor activo
+  )
+
+Migración v4 → v5 en initialize_database():
+  - Crear tabla proveedores_producto
+  - Para cada producto con proveedor != '' y precio_costo > 0:
+    insertar una fila con es_principal = 1
+  - Actualizar _SCHEMA_VERSION = 5
+
+
+E2. Funciones nuevas en stock_app.py
+-------------------------------------
+  def get_product_suppliers(conn, codigo: str) -> list[sqlite3.Row]:
+      # Retorna todos los proveedores del producto, principal primero
+
+  def add_product_supplier(conn, codigo: str, proveedor: str,
+                            precio_costo: float) -> None:
+      # Inserta nuevo proveedor para el producto
+
+  def set_primary_supplier(conn, supplier_id: int, codigo: str) -> None:
+      # Marca uno como principal y actualiza
+      # productos.proveedor + productos.precio_costo
+
+  def remove_product_supplier(conn, supplier_id: int) -> None:
+      # Elimina un proveedor (no se puede eliminar el principal
+      # si es el único)
+
+
+E3. UI en formulario de producto (pestaña Principal)
+----------------------------------------------------
+- Debajo del campo "Proveedor", agregar mini-tabla (Treeview pequeño)
+  que lista todos los proveedores del producto con su precio de costo.
+- Columnas de la mini-tabla: Proveedor | Precio costo | Principal
+- Botones: [+ Agregar proveedor] [Establecer como principal] [Eliminar]
+- Al hacer "Establecer como principal":
+    * Se actualiza productos.proveedor y productos.precio_costo
+    * El margen en la tabla principal se recalcula automáticamente
+- El campo "Proveedor" del formulario pasa a ser de solo lectura
+  (refleja siempre el proveedor principal).
+
+
+E4. Impacto en lógica existente — sin cambios
+---------------------------------------------
+  register_sale()      → sin cambios (usa productos.precio_costo)
+  bulk_price_increase()→ sin cambios (trabaja sobre productos.precio)
+  search_products()    → sin cambios (proveedor sigue siendo el principal)
+  _calc_margen()       → sin cambios (usa productos.precio_costo)
+
+  El filtro por proveedor en la tabla de precios (combo) muestra el
+  proveedor principal. Se puede mejorar después para buscar también
+  en proveedores alternativos.
+
+
+E5. Tests nuevos para Fase E
+-----------------------------
+  test_add_product_supplier_creates_record()
+  test_set_primary_supplier_updates_producto()
+  test_remove_supplier_not_last()
+  test_migration_v4_to_v5_preserves_existing_supplier()
+
+
+======================================================================
+ORDEN DE EJECUCIÓN SUGERIDO
+======================================================================
+
+1. A1–A4  → reverse_sale con ID real (cambios coordinados app+gui)
+2. A5–A6  → SQL fuera de la GUI (independientes entre sí)
+3. B1–B4  → UX + alineación + índices (independientes entre sí)
+4. E1–E5  → Multi-proveedor (antes del despliegue, cambia schema)
+5. C1–C2  → Tests (después de A y E para cubrir todo lo nuevo)
+6. D1–D4  → Deployment (al final, cuando el código está estable)
+
+
+======================================================================
+VERIFICACIÓN FINAL
+======================================================================
+
+1. python -m unittest test_stock_app.StockAppTests
+   → todos los tests pasan
+
+2. python -m unittest test_stock_app.StockGuiTests
+   → todos los tests pasan sin corrupción de estado
+
+3. Flujo manual: agregar producto → agregar 2 proveedores → cambiar
+   principal → verificar que el margen se actualiza en la tabla
+
+4. Flujo manual: agregar al carrito → cobrar → undo x3
+   → verificar stock y caja correctos
+
+5. Flujo manual: aumento masivo de precios → undo
+   → verificar precios restaurados e historial de precios
+
+6. build.bat → genera dist\SistemaDeStock.exe
+   → doble clic en máquina sin Python en PATH → app abre correctamente
+
+7. Vaciar carrito → confirma diálogo antes de limpiar
+
+8. Buscar en historial de precios → filtra en tiempo real sin lentitud

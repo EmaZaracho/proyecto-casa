@@ -5,7 +5,7 @@ import sqlite3
 import tkinter as tk
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
 import stock_app
@@ -255,7 +255,7 @@ class StockGui(tk.Tk):
             row=1, column=6, sticky="ew", padx=(0, 4)
         )
         self._proveedor_combo = ttk.Combobox(
-            self._product_form_frame, textvariable=self.proveedor_var
+            self._product_form_frame, textvariable=self.proveedor_var, state="readonly"
         )
         self._proveedor_combo.grid(row=1, column=7, sticky="ew")
         self._proveedor_combo.bind("<ButtonPress>", lambda _: self._refresh_form_proveedor())
@@ -279,6 +279,42 @@ class StockGui(tk.Tk):
         )
         self._cancel_edit_btn.grid(row=3, column=7, sticky="ew")
         self._cancel_edit_btn.grid_remove()
+
+        suppliers_frame = ttk.LabelFrame(
+            self._product_form_frame, text="Proveedores del producto", padding=6
+        )
+        suppliers_frame.grid(row=4, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        suppliers_frame.columnconfigure(0, weight=1)
+
+        supplier_cols = ("proveedor", "precio_costo", "principal")
+        self._suppliers_table = ttk.Treeview(
+            suppliers_frame, columns=supplier_cols, show="headings", height=3
+        )
+        for col, label, width in (
+            ("proveedor", "Proveedor", 220),
+            ("precio_costo", "Precio costo", 110),
+            ("principal", "Principal", 80),
+        ):
+            anchor = "e" if col == "precio_costo" else "w"
+            self._suppliers_table.heading(col, text=label, anchor=anchor)
+            self._suppliers_table.column(col, width=width, minwidth=60, anchor=anchor)
+        self._suppliers_table.grid(row=0, column=0, sticky="ew")
+
+        supplier_actions = ttk.Frame(suppliers_frame)
+        supplier_actions.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self._supplier_add_btn = ttk.Button(
+            supplier_actions, text="+ Agregar proveedor", command=self._add_product_supplier
+        )
+        self._supplier_add_btn.pack(fill="x", pady=(0, 4))
+        self._supplier_primary_btn = ttk.Button(
+            supplier_actions, text="Establecer principal", command=self._set_primary_supplier
+        )
+        self._supplier_primary_btn.pack(fill="x", pady=(0, 4))
+        self._supplier_remove_btn = ttk.Button(
+            supplier_actions, text="Eliminar", command=self._remove_product_supplier
+        )
+        self._supplier_remove_btn.pack(fill="x")
+        self._set_supplier_controls_state("disabled")
 
         self._product_form_frame.grid_remove()
 
@@ -308,8 +344,14 @@ class StockGui(tk.Tk):
             self.products_table.heading(
                 col, text=label,
                 command=lambda c=col: self._sort_products(c),
+                anchor="e" if col in {"precio", "margen", "stock", "minimo"} else "w",
             )
-            self.products_table.column(col, width=width, minwidth=38)
+            self.products_table.column(
+                col,
+                width=width,
+                minwidth=38,
+                anchor="e" if col in {"precio", "margen", "stock", "minimo"} else "w",
+            )
 
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.products_table.yview)
         self.products_table.configure(yscrollcommand=sb.set)
@@ -542,8 +584,9 @@ class StockGui(tk.Tk):
             ("margen", "Margen %", 80),
             ("proveedor", "Proveedor", 150),
         ):
-            self.price_table.heading(col, text=label)
-            self.price_table.column(col, width=width, minwidth=55)
+            anchor = "e" if col in {"precio", "precio_costo", "margen"} else "w"
+            self.price_table.heading(col, text=label, anchor=anchor)
+            self.price_table.column(col, width=width, minwidth=55, anchor=anchor)
 
         psb = ttk.Scrollbar(table_frame, orient="vertical", command=self.price_table.yview)
         self.price_table.configure(yscrollcommand=psb.set)
@@ -618,10 +661,8 @@ class StockGui(tk.Tk):
 
     def _refresh_price_history(self) -> None:
         clear_table(self._hist_table)
-        query = self._hist_search_var.get().lower()
-        for row in stock_app.get_price_history(self.conn):
-            if query and query not in row["codigo"].lower() and query not in row["nombre"].lower():
-                continue
+        query = self._hist_search_var.get()
+        for row in stock_app.search_price_history(self.conn, query):
             ant = float(row["precio_anterior"])
             nvo = float(row["precio_nuevo"])
             if ant > 0:
@@ -693,8 +734,9 @@ class StockGui(tk.Tk):
             ("total", "Subtotal", 80),
             ("forma_pago", "Pago", 90),
         ):
-            self.ventas_table.heading(col, text=label)
-            self.ventas_table.column(col, width=width, minwidth=40)
+            anchor = "e" if col in {"cantidad", "precio_unit", "total"} else "w"
+            self.ventas_table.heading(col, text=label, anchor=anchor)
+            self.ventas_table.column(col, width=width, minwidth=40, anchor=anchor)
 
         vsb = ttk.Scrollbar(self._ventas_table_frame, orient="vertical", command=self.ventas_table.yview)
         self.ventas_table.configure(yscrollcommand=vsb.set)
@@ -923,6 +965,107 @@ class StockGui(tk.Tk):
     def _refresh_price_proveedor(self) -> None:
         self._price_proveedor_combo["values"] = stock_app.get_all_proveedores(self.conn)
 
+    def _set_supplier_controls_state(self, state: str) -> None:
+        for btn in (
+            self._supplier_add_btn,
+            self._supplier_primary_btn,
+            self._supplier_remove_btn,
+        ):
+            btn.configure(state=state)
+
+    def _refresh_product_suppliers(self) -> None:
+        clear_table(self._suppliers_table)
+        if not self._edit_mode or not self._edit_codigo:
+            self._set_supplier_controls_state("disabled")
+            return
+        self._set_supplier_controls_state("normal")
+        for row in stock_app.get_product_suppliers(self.conn, self._edit_codigo):
+            self._suppliers_table.insert(
+                "",
+                "end",
+                iid=str(row["id"]),
+                values=(
+                    row["proveedor"],
+                    f"${float(row['precio_costo']):.2f}",
+                    "Si" if int(row["es_principal"]) else "",
+                ),
+            )
+
+    def _sync_primary_supplier_fields(self) -> None:
+        if not self._edit_codigo:
+            return
+        product = stock_app.get_product(self.conn, self._edit_codigo)
+        self.proveedor_var.set(product["proveedor"] or "")
+        self.precio_costo_var.set(str(product["precio_costo"]))
+
+    def _add_product_supplier(self) -> None:
+        if not self._edit_mode or not self._edit_codigo:
+            messagebox.showerror("Guardar primero", "Guarda el producto antes de agregar proveedores.")
+            return
+        proveedor = simpledialog.askstring(
+            "Agregar proveedor", "Proveedor:", parent=self
+        )
+        if proveedor is None:
+            return
+        proveedor = proveedor.strip()
+        if not proveedor:
+            messagebox.showerror("Proveedor requerido", "El proveedor es obligatorio.")
+            return
+        costo_raw = simpledialog.askstring(
+            "Agregar proveedor", "Precio de costo:", parent=self
+        )
+        if costo_raw is None:
+            return
+        try:
+            precio_costo = parse_float(costo_raw, "precio costo")
+            stock_app.add_product_supplier(self.conn, self._edit_codigo, proveedor, precio_costo)
+        except (ValueError, stock_app.StockError) as exc:
+            messagebox.showerror("No se pudo agregar", str(exc))
+            return
+        self._sync_primary_supplier_fields()
+        self._refresh_product_suppliers()
+        self.refresh_products()
+        self.refresh_price_table()
+        self._set_status(f"Proveedor '{proveedor}' agregado.")
+
+    def _selected_supplier_id(self) -> int | None:
+        selected = self._suppliers_table.selection()
+        if not selected:
+            messagebox.showerror("Seleccione un proveedor", "Elija un proveedor de la lista.")
+            return None
+        return int(selected[0])
+
+    def _set_primary_supplier(self) -> None:
+        if not self._edit_codigo:
+            return
+        supplier_id = self._selected_supplier_id()
+        if supplier_id is None:
+            return
+        try:
+            stock_app.set_primary_supplier(self.conn, supplier_id, self._edit_codigo)
+        except stock_app.StockError as exc:
+            messagebox.showerror("No se pudo actualizar", str(exc))
+            return
+        self._sync_primary_supplier_fields()
+        self._refresh_product_suppliers()
+        self.refresh_all()
+        self._set_status("Proveedor principal actualizado.")
+
+    def _remove_product_supplier(self) -> None:
+        supplier_id = self._selected_supplier_id()
+        if supplier_id is None:
+            return
+        if not messagebox.askyesno("Eliminar proveedor", "Eliminar el proveedor seleccionado?"):
+            return
+        try:
+            stock_app.remove_product_supplier(self.conn, supplier_id)
+        except stock_app.StockError as exc:
+            messagebox.showerror("No se pudo eliminar", str(exc))
+            return
+        self._refresh_product_suppliers()
+        self.refresh_all()
+        self._set_status("Proveedor eliminado.")
+
     def _clear_price_filters(self) -> None:
         self.price_proveedor_var.set("")
         self.price_search_var.set("")
@@ -1140,6 +1283,11 @@ class StockGui(tk.Tk):
 
     def _clear_cart(self) -> None:
         if self._cart:
+            if not messagebox.askyesno(
+                "Vaciar carrito",
+                f"Eliminar {len(self._cart)} producto(s)?",
+            ):
+                return
             self._push_undo({
                 "type": "cart_clear",
                 "items": [dict(item) for item in self._cart],
@@ -1160,11 +1308,16 @@ class StockGui(tk.Tk):
 
         for item in self._cart:
             try:
-                total = stock_app.register_sale(
+                total, sale_id = stock_app.register_sale(
                     self.conn, item["codigo"], item["cantidad"],
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
-                processed.append({**item, "total": total, "sale_date": sale_date.isoformat()})
+                processed.append({
+                    **item,
+                    "total": total,
+                    "sale_id": sale_id,
+                    "sale_date": sale_date.isoformat(),
+                })
             except stock_app.InsufficientStockError as exc:
                 errors.append(f"• {item['nombre']}: {exc}")
             except stock_app.StockError as exc:
@@ -1176,6 +1329,7 @@ class StockGui(tk.Tk):
                 "codigo": item["codigo"],
                 "cantidad": item["cantidad"],
                 "total": item["total"],
+                "sale_id": item["sale_id"],
                 "sale_date": item["sale_date"],
                 "description": f"venta {item['cantidad']}x '{item['codigo']}' (${item['total']:.2f})",
             })
@@ -1196,7 +1350,8 @@ class StockGui(tk.Tk):
             self._set_status(
                 f"✓ Carrito cobrado [{forma_pago}] — {len(processed)} prod. — Total: ${total_cobrado:.2f}"
             )
-            self._clear_cart()
+            self._cart.clear()
+            self._refresh_cart_display()
 
     # =========================================================================
     # Price increase
@@ -1233,15 +1388,7 @@ class StockGui(tk.Tk):
             messagebox.showerror("Valor invalido", "El porcentaje debe ser mayor a 0.")
             return
 
-        placeholders = ",".join("?" for _ in codigos[:3])
-        sample_rows = (
-            self.conn.execute(
-                f"SELECT nombre, precio FROM productos WHERE codigo IN ({placeholders})",
-                codigos[:3],
-            ).fetchall()
-            if placeholders
-            else []
-        )
+        sample_rows = stock_app.get_products_preview(self.conn, codigos[:3])
         preview_lines = "\n".join(
             f"  {row['nombre'][:25]}: ${row['precio']:.0f} -> "
             f"${round(row['precio'] * (1 + pct / 100) / 10) * 10:.0f}"
@@ -1553,14 +1700,10 @@ class StockGui(tk.Tk):
                     action["cantidad"],
                     action["total"],
                     action["sale_date"],
+                    sale_id=action.get("sale_id"),
                 )
             elif action["type"] == "price_increase":
-                for codigo, old_price, _ in action["changes"]:
-                    self.conn.execute(
-                        "UPDATE productos SET precio = ? WHERE codigo = ?",
-                        (old_price, codigo),
-                    )
-                self.conn.commit()
+                stock_app.restore_prices(self.conn, action["changes"])
             elif action["type"] == "cart_change":
                 idx = self._find_cart_item_index(action["codigo"])
                 previous_quantity = int(action.get("previous_quantity", 0))
@@ -1610,6 +1753,9 @@ class StockGui(tk.Tk):
         self.stock_minimo_var.set("")
         self.proveedor_var.set("")
         self.notas_var.set("")
+        if hasattr(self, "_suppliers_table"):
+            clear_table(self._suppliers_table)
+            self._set_supplier_controls_state("disabled")
 
     def _show_ajuste_stock(self) -> None:
         selected = self.products_table.selection()
@@ -1789,6 +1935,7 @@ class StockGui(tk.Tk):
         self._save_btn.configure(text="Actualizar")
         self._product_form_frame.configure(text="Editar producto")
         self._cancel_edit_btn.grid()
+        self._refresh_product_suppliers()
         self._notebook.select(0)
 
     def cancel_edit(self) -> None:
@@ -1860,7 +2007,7 @@ class StockGui(tk.Tk):
         try:
             cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
             sale_date = date.today()
-            total = stock_app.register_sale(
+            total, sale_id = stock_app.register_sale(
                 self.conn, codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
             )
         except stock_app.ProductNotFoundError:
@@ -1878,7 +2025,7 @@ class StockGui(tk.Tk):
             if not allow:
                 return
             try:
-                total = stock_app.register_sale(
+                total, sale_id = stock_app.register_sale(
                     self.conn, codigo, cantidad, allow_negative=True,
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
@@ -1896,6 +2043,7 @@ class StockGui(tk.Tk):
             "codigo": codigo,
             "cantidad": cantidad,
             "total": total,
+            "sale_id": sale_id,
             "sale_date": sale_date.isoformat(),
             "description": f"venta {cantidad}x '{codigo}' (${total:.2f})",
         })
