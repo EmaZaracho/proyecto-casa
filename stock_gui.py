@@ -90,6 +90,14 @@ class StockGui(tk.Tk):
         self._ventas_hasta_var = tk.StringVar(value="")
         self._ventas_range_active = False
 
+        # ── reportes tab vars ──
+        self._rep_productos_var = tk.BooleanVar(value=True)
+        self._rep_ventas_var = tk.BooleanVar(value=True)
+        self._rep_pendientes_var = tk.BooleanVar(value=False)
+        self._rep_stock_bajo_var = tk.BooleanVar(value=True)
+        self._rep_desde_var = tk.StringVar(value=date.today().replace(day=1).isoformat())
+        self._rep_hasta_var = tk.StringVar(value=date.today().isoformat())
+
         # ── sorting state ──
         self._sort_col: str = ""
         self._sort_asc: bool = True
@@ -172,15 +180,18 @@ class StockGui(tk.Tk):
         tab2 = ttk.Frame(self._notebook, padding=6)
         tab3 = ttk.Frame(self._notebook, padding=6)
         tab4 = ttk.Frame(self._notebook, padding=6)
+        tab5 = ttk.Frame(self._notebook, padding=6)
         self._notebook.add(tab1, text="  Principal  ")
         self._notebook.add(tab2, text="  Gestión de precios  ")
         self._notebook.add(tab3, text="  Ventas del día  ")
         self._notebook.add(tab4, text="  Historial de precios  ")
+        self._notebook.add(tab5, text="  Reportes  ")
 
         self._build_tab_principal(tab1)
         self._build_tab_precios(tab2)
         self._build_tab_ventas(tab3)
         self._build_tab_historial(tab4)
+        self._build_tab_reportes(tab5)
 
         status_bar = ttk.Label(
             outer, textvariable=self._status_var,
@@ -614,11 +625,7 @@ class StockGui(tk.Tk):
             inc_frame, text="Exportar productos CSV",
             command=self._export_products_csv,
         ).grid(row=0, column=5, padx=(0, 8))
-        ttk.Button(
-            inc_frame, text="Exportar PDF",
-            command=self._export_pdf,
-        ).grid(row=0, column=6, padx=(0, 8))
-        ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=7, sticky="e")
+        ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=6, sticky="e")
 
     # ── Tab 4: price history ──────────────────────────────────────────────────
 
@@ -1578,99 +1585,248 @@ class StockGui(tk.Tk):
         n = stock_app.export_products_csv(self.conn, Path(filepath))
         self._set_status(f"✓ Exportados {n} productos a {Path(filepath).name}")
 
-    def _export_pdf(self) -> None:
+    # ── Tab 5: reportes ───────────────────────────────────────────────────────
+
+    def _build_tab_reportes(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            parent, text="Generador de reportes PDF",
+            style="Title.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 14))
+
+        sec_frame = ttk.LabelFrame(parent, text="Secciones a incluir", padding=14)
+        sec_frame.grid(row=1, column=0, sticky="ew")
+        sec_frame.columnconfigure(1, weight=1)
+
+        # ── Productos ─────────────────────────────────────────────────────────
+        ttk.Checkbutton(
+            sec_frame, text="Todos los productos",
+            variable=self._rep_productos_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        # ── Ventas ────────────────────────────────────────────────────────────
+        ventas_cb = ttk.Checkbutton(
+            sec_frame, text="Ventas",
+            variable=self._rep_ventas_var,
+            command=self._rep_toggle_ventas_dates,
+        )
+        ventas_cb.grid(row=1, column=0, sticky="w")
+
+        dates_frame = ttk.Frame(sec_frame)
+        dates_frame.grid(row=1, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(dates_frame, text="Desde:").grid(row=0, column=0, padx=(0, 4))
+        self._rep_desde_entry = ttk.Entry(dates_frame, textvariable=self._rep_desde_var, width=12)
+        self._rep_desde_entry.grid(row=0, column=1, padx=(0, 12))
+        ttk.Label(dates_frame, text="Hasta:").grid(row=0, column=2, padx=(0, 4))
+        self._rep_hasta_entry = ttk.Entry(dates_frame, textvariable=self._rep_hasta_var, width=12)
+        self._rep_hasta_entry.grid(row=0, column=3)
+
+        hint_lbl = ttk.Label(
+            sec_frame, text="Formato AAAA-MM-DD. Dejá vacío para usar solo la fecha de hoy.",
+            foreground="gray", font=("Segoe UI", 8),
+        )
+        hint_lbl.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(2, 10))
+        self._muted_labels.append(hint_lbl)
+
+        # ── Pendientes ────────────────────────────────────────────────────────
+        ttk.Checkbutton(
+            sec_frame, text="Pendientes",
+            variable=self._rep_pendientes_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        # ── Stock bajo ────────────────────────────────────────────────────────
+        ttk.Checkbutton(
+            sec_frame, text="Stock bajo",
+            variable=self._rep_stock_bajo_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        # ── Botón generar ─────────────────────────────────────────────────────
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=2, column=0, sticky="e", pady=(18, 0))
+        ttk.Button(
+            btn_row, text="  Generar PDF  ", command=self._generar_reporte_pdf,
+        ).pack()
+
+    def _rep_toggle_ventas_dates(self) -> None:
+        state = "normal" if self._rep_ventas_var.get() else "disabled"
+        self._rep_desde_entry.configure(state=state)
+        self._rep_hasta_entry.configure(state=state)
+
+    def _generar_reporte_pdf(self) -> None:
+        if not any([
+            self._rep_productos_var.get(),
+            self._rep_ventas_var.get(),
+            self._rep_pendientes_var.get(),
+            self._rep_stock_bajo_var.get(),
+        ]):
+            messagebox.showwarning("Aviso", "Seleccioná al menos una sección.")
+            return
+
         try:
             from fpdf import FPDF  # type: ignore
         except ImportError:
             messagebox.showerror("Error", "Falta la librería fpdf2.\nEjecutá: pip install fpdf2")
             return
 
-        dialog = tk.Toplevel(self)
-        dialog.title("Exportar PDF")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text="¿Qué incluir en el PDF?", font=("Segoe UI", 10, "bold")).pack(
-            padx=20, pady=(16, 8)
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            initialfile=f"reporte_{date.today().isoformat()}.pdf",
+            filetypes=[("PDF", "*.pdf"), ("Todos los archivos", "*.*")],
         )
+        if not filepath:
+            return
 
-        var_productos = tk.BooleanVar(value=True)
-        var_stock_bajo = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dialog, text="Lista de productos", variable=var_productos).pack(
-            anchor="w", padx=28
-        )
-        ttk.Checkbutton(dialog, text="Productos con stock bajo", variable=var_stock_bajo).pack(
-            anchor="w", padx=28, pady=(4, 0)
-        )
+        moneda = self._config.get("moneda", "$")
+        negocio = self._config.get("nombre_negocio", "Reporte")
 
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=16, padx=20, fill="x")
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
 
-        def _generar():
-            if not var_productos.get() and not var_stock_bajo.get():
-                messagebox.showwarning("Aviso", "Seleccioná al menos una sección.", parent=dialog)
-                return
-            dialog.destroy()
-            filepath = filedialog.asksaveasfilename(
-                defaultextension=".pdf",
-                initialfile="reporte_stock.pdf",
-                filetypes=[("PDF", "*.pdf"), ("Todos los archivos", "*.*")],
-            )
-            if not filepath:
-                return
+        # ── Encabezado ────────────────────────────────────────────────────────
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, negocio, ln=True, align="C")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+        pdf.ln(8)
 
-            pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=15)
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, self._config.get("nombre_negocio", "Reporte de Stock"), ln=True, align="C")
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(0, 6, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+        # ── Sección: todos los productos ──────────────────────────────────────
+        if self._rep_productos_var.get():
+            productos = stock_app.list_products(self.conn)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_fill_color(220, 220, 220)
+            pdf.cell(0, 8, f"Productos ({len(productos)})", ln=True, fill=True)
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 8)
+            for h, w in [("Código", 25), ("Nombre", 65), ("Precio", 25),
+                         ("Costo", 25), ("Stock", 18), ("Mín.", 18), ("Proveedor", 14)]:
+                pdf.cell(w, 7, h, border=1, align="C")
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 8)
+            for p in productos:
+                precio = float(p["precio"])
+                costo = float(p["precio_costo"])
+                pdf.cell(25, 6, str(p["codigo"]), border=1)
+                pdf.cell(65, 6, str(p["nombre"])[:38], border=1)
+                pdf.cell(25, 6, f"{moneda}{precio:.2f}", border=1, align="R")
+                pdf.cell(25, 6, f"{moneda}{costo:.2f}" if costo > 0 else "-", border=1, align="R")
+                pdf.cell(18, 6, str(p["stock"]), border=1, align="C")
+                pdf.cell(18, 6, str(p["stock_minimo"]), border=1, align="C")
+                pdf.cell(14, 6, str(p["proveedor"] or "-")[:8], border=1)
+                pdf.ln()
             pdf.ln(6)
 
-            if var_productos.get():
-                productos = stock_app.list_products(self.conn)
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.cell(0, 8, "Lista de Productos", ln=True)
-                pdf.set_font("Helvetica", "B", 8)
-                headers = [("Código", 25), ("Nombre", 65), ("Precio", 22), ("Stock", 18), ("Mín.", 18), ("Proveedor", 42)]
-                for h, w in headers:
-                    pdf.cell(w, 7, h, border=1, align="C")
-                pdf.ln()
+        # ── Sección: ventas ───────────────────────────────────────────────────
+        if self._rep_ventas_var.get():
+            desde_raw = self._rep_desde_var.get().strip()
+            hasta_raw = self._rep_hasta_var.get().strip()
+            hoy = date.today().isoformat()
+            try:
+                desde = date.fromisoformat(desde_raw).isoformat() if desde_raw else hoy
+                hasta = date.fromisoformat(hasta_raw).isoformat() if hasta_raw else hoy
+            except ValueError:
+                messagebox.showerror("Error", "Fechas inválidas en la sección Ventas.\nUsá el formato AAAA-MM-DD.")
+                return
+
+            ventas = stock_app.get_ventas_rango(self.conn, desde, hasta)
+            resumen = stock_app.get_range_summary(self.conn, desde, hasta)
+
+            titulo_ventas = (
+                f"Ventas del {desde}"
+                if desde == hasta
+                else f"Ventas del {desde} al {hasta}"
+            )
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_fill_color(220, 220, 220)
+            pdf.cell(0, 8, titulo_ventas, ln=True, fill=True)
+            pdf.ln(2)
+
+            # Resumen financiero
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(60, 6, f"Total: {moneda}{resumen['total']:.2f}", border=0)
+            pdf.cell(60, 6, f"Transacciones: {resumen['count']}", border=0)
+            ganancia = resumen.get("ganancia_bruta", 0)
+            pdf.cell(0, 6, f"Ganancia bruta: {moneda}{ganancia:.2f}", ln=True, border=0)
+
+            # Desglose por forma de pago
+            if resumen["breakdown"]:
                 pdf.set_font("Helvetica", "", 8)
-                for p in productos:
-                    pdf.cell(25, 6, str(p["codigo"]), border=1)
-                    pdf.cell(65, 6, str(p["nombre"])[:38], border=1)
-                    pdf.cell(22, 6, f"${float(p['precio']):.2f}", border=1, align="R")
-                    pdf.cell(18, 6, str(p["stock"]), border=1, align="C")
-                    pdf.cell(18, 6, str(p["stock_minimo"]), border=1, align="C")
-                    pdf.cell(42, 6, str(p["proveedor"] or "-")[:22], border=1)
-                    pdf.ln()
-                pdf.ln(4)
+                for row in resumen["breakdown"]:
+                    pdf.cell(0, 5,
+                             f"  {row['forma_pago']}: {row['cantidad']} ventas — {moneda}{float(row['total']):.2f}",
+                             ln=True)
+            pdf.ln(3)
 
-            if var_stock_bajo.get():
-                bajo = stock_app.low_stock_products(self.conn)
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.cell(0, 8, "Productos con Stock Bajo", ln=True)
-                pdf.set_font("Helvetica", "B", 8)
-                for h, w in [("Código", 30), ("Nombre", 90), ("Stock actual", 35), ("Stock mín.", 35)]:
-                    pdf.cell(w, 7, h, border=1, align="C")
+            # Tabla de ventas
+            pdf.set_font("Helvetica", "B", 8)
+            for h, w in [("Fecha", 22), ("Hora", 18), ("Nombre", 70),
+                         ("Cant.", 14), ("P.Unit.", 24), ("Total", 24), ("Pago", 18)]:
+                pdf.cell(w, 7, h, border=1, align="C")
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 8)
+            for v in ventas:
+                pdf.cell(22, 6, str(v["fecha"]), border=1)
+                pdf.cell(18, 6, str(v["hora"])[:5], border=1, align="C")
+                pdf.cell(70, 6, str(v["nombre"])[:42], border=1)
+                pdf.cell(14, 6, str(v["cantidad"]), border=1, align="C")
+                pdf.cell(24, 6, f"{moneda}{float(v['precio_unit']):.2f}", border=1, align="R")
+                pdf.cell(24, 6, f"{moneda}{float(v['total']):.2f}", border=1, align="R")
+                pdf.cell(18, 6, str(v["forma_pago"])[:10], border=1)
                 pdf.ln()
+
+            # Top 5 productos
+            if resumen["top_products"]:
+                pdf.ln(3)
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.cell(0, 6, "Top 5 productos más vendidos:", ln=True)
                 pdf.set_font("Helvetica", "", 8)
-                for p in bajo:
-                    pdf.cell(30, 6, str(p["codigo"]), border=1)
-                    pdf.cell(90, 6, str(p["nombre"])[:48], border=1)
-                    pdf.cell(35, 6, str(p["stock"]), border=1, align="C")
-                    pdf.cell(35, 6, str(p["stock_minimo"]), border=1, align="C")
-                    pdf.ln()
+                for i, row in enumerate(resumen["top_products"], 1):
+                    pdf.cell(0, 5,
+                             f"  {i}. {row['nombre']} — {row['total_cant']} unid. — {moneda}{float(row['total_monto']):.2f}",
+                             ln=True)
+            pdf.ln(6)
 
-            pdf.output(filepath)
-            self._set_status(f"✓ PDF exportado: {Path(filepath).name}")
+        # ── Sección: pendientes ───────────────────────────────────────────────
+        if self._rep_pendientes_var.get():
+            pendientes = stock_app.list_pending(self.conn)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_fill_color(220, 220, 220)
+            pdf.cell(0, 8, f"Pendientes ({len(pendientes)})", ln=True, fill=True)
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 8)
+            for h, w in [("Estado", 30), ("Descripción", 120), ("Creado", 40)]:
+                pdf.cell(w, 7, h, border=1, align="C")
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 8)
+            for p in pendientes:
+                pdf.cell(30, 6, str(p["estado"]), border=1, align="C")
+                pdf.cell(120, 6, str(p["descripcion"])[:65], border=1)
+                pdf.cell(40, 6, str(p["creado_en"])[:16], border=1, align="C")
+                pdf.ln()
+            pdf.ln(6)
 
-        ttk.Button(btn_frame, text="Generar PDF", command=_generar).pack(side="right", padx=(8, 0))
-        ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
-        self._center_dialog(dialog)
+        # ── Sección: stock bajo ───────────────────────────────────────────────
+        if self._rep_stock_bajo_var.get():
+            bajo = stock_app.low_stock_products(self.conn)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_fill_color(220, 220, 220)
+            pdf.cell(0, 8, f"Stock bajo ({len(bajo)} productos)", ln=True, fill=True)
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 8)
+            for h, w in [("Código", 30), ("Nombre", 100), ("Stock actual", 30), ("Stock mín.", 30)]:
+                pdf.cell(w, 7, h, border=1, align="C")
+            pdf.ln()
+            pdf.set_font("Helvetica", "", 8)
+            for p in bajo:
+                pdf.cell(30, 6, str(p["codigo"]), border=1)
+                pdf.cell(100, 6, str(p["nombre"])[:55], border=1)
+                pdf.cell(30, 6, str(p["stock"]), border=1, align="C")
+                pdf.cell(30, 6, str(p["stock_minimo"]), border=1, align="C")
+                pdf.ln()
+
+        pdf.output(filepath)
+        self._set_status(f"✓ PDF exportado: {Path(filepath).name}")
 
     # =========================================================================
     # Undo
