@@ -1,61 +1,48 @@
-# Sistema simple de stock
+# Sistema de Stock
 
-Aplicación de escritorio/console en Python que usa SQLite local para gestionar productos,
-ventas, caja y reportes básicos.
+Aplicación de escritorio en Python para gestión de inventario y punto de venta de un negocio pequeño. Corre localmente en Windows con Python + Tkinter + SQLite. Sin servidor, sin internet requerido.
 
 **Requisitos**
 
 - Python 3.10 o superior
-- Módulos estándar: `sqlite3`, `tkinter` (para la interfaz gráfica)
-- Dependencias opcionales:
-	- `fpdf2` — para exportar PDF (instalable con `pip install fpdf2`)
+- Módulos estándar: `sqlite3`, `tkinter` (incluidos en Python)
+- Dependencia opcional: `fpdf2` — para exportar PDF (`pip install fpdf2`)
 
-**Instalación (recomendada)**
-
-1. Crear y activar un entorno virtual:
+**Instalación**
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-2. (Opcional) Instalar dependencias necesarias para PDF:
-
-```powershell
-pip install fpdf2
-```
+También podés ejecutar `setup.bat` con doble click para hacer todo en un paso.
 
 **Uso**
-
-- Interfaz gráfica:
 
 ```powershell
 python stock_gui.py
 ```
 
-También puedes ejecutar `iniciar_gui.bat` con doble click en Windows.
+O con doble click en `iniciar_gui.bat` (Windows).
 
-- Modo consola (CLI):
-
-```powershell
-python stock_app.py
-```
-
-El programa crea automáticamente:
-
-- `stock.db` (base de datos SQLite)
-- `fotos_productos/` (para fotografías de productos)
-- `backups/` (copias de seguridad diarias)
+El programa crea automáticamente `stock.db`, `fotos_productos/` y `backups/` en la primera ejecución.
 
 **Características principales**
 
-- Alta y edición de productos (clave primaria: `codigo`).
-- Manejo opcional de fotos, guardadas como `[codigo]_[archivo_original]`.
-- Registro de ventas y actualización de stock.
-- Control de ventas con opción de permitir stock negativo.
-- Registro de caja diaria y desglose por forma de pago.
-- Historial de cambios de precio y deshacer (undo) en la interfaz.
-- Pendientes (to‑do) con estados `Pendiente` / `Completado`.
+- Alta, edición y eliminación de productos (clave: `codigo`).
+- Multi-proveedor por producto: cada producto puede tener N proveedores con su propio precio de costo; el proveedor principal determina el margen.
+- Importar productos y actualizar stock desde una **boleta CSV** (`codigo,nombre,cantidad,precio_costo,precio_venta,proveedor`). Los conflictos de precio se resuelven 1 a 1 con opciones: mantener, actualizar, o fijar porcentaje de ganancia.
+- Registro de ventas y actualización de stock. Modo carrito para cobrar múltiples productos juntos.
+- Control de ventas por forma de pago (Efectivo, Débito, Crédito, Transferencia).
+- Registro de caja diaria con desglose por forma de pago y ganancia bruta.
+- Aumentos masivos de precio por porcentaje con vista previa.
+- Historial de cambios de precio con motivo (Edición manual / Aumento masivo / Importación boleta).
+- Filtro de ventas por fecha o rango de fechas (formato DD-MM-AAAA).
+- **Deshacer (Ctrl+Z) y Rehacer (Ctrl+Y)** — hasta 10 pasos.
+- Exportar productos y ventas a CSV; exportar reportes a PDF.
+- Pendientes (to-do) internos con estados Pendiente / Completado.
+- Modo oscuro. Backup automático diario.
 
 **Ejecutar pruebas**
 
@@ -63,10 +50,17 @@ El programa crea automáticamente:
 python -m unittest -v
 ```
 
-Las pruebas de GUI que requieren display se omiten automáticamente si no hay display disponible.
+79 tests. Las pruebas de GUI se omiten automáticamente si no hay display disponible.
+
+**Empaquetar como .exe**
+
+```powershell
+setup.bat       # instala dependencias incluido PyInstaller
+build.bat       # genera dist\SistemaDeStock.exe
+```
 
 **Notas**
 
-- Recomendado usar Python 3.10+ debido al uso de sintaxis de tipado moderno.
-- La exportación a PDF requiere `fpdf2`; si no está instalada, la aplicación mostrará una sugerencia para instalarla.
-- Si necesitás ayuda para ejecutar o empaquetar la aplicación, avisame y te guío.
+- Exportación a PDF requiere `fpdf2`; la app sugiere instalarlo si falta.
+- El formato de fecha en toda la interfaz es DD-MM-AAAA.
+- `stock.db` y `config.json` están en `.gitignore`.

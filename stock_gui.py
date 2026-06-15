@@ -182,17 +182,20 @@ class StockGui(tk.Tk):
         self._notebook.grid(row=1, column=0, sticky="nsew")
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
+        tab0 = ttk.Frame(self._notebook, padding=12)
         tab1 = ttk.Frame(self._notebook, padding=6)
         tab2 = ttk.Frame(self._notebook, padding=6)
         tab3 = ttk.Frame(self._notebook, padding=6)
         tab4 = ttk.Frame(self._notebook, padding=6)
         tab5 = ttk.Frame(self._notebook, padding=6)
+        self._notebook.add(tab0, text="  Resumen  ")
         self._notebook.add(tab1, text="  Principal  ")
         self._notebook.add(tab2, text="  Gestión de precios  ")
         self._notebook.add(tab3, text="  Ventas del día  ")
         self._notebook.add(tab4, text="  Historial de precios  ")
         self._notebook.add(tab5, text="  Reportes  ")
 
+        self._build_tab_dashboard(tab0)
         self._build_tab_principal(tab1)
         self._build_tab_precios(tab2)
         self._build_tab_ventas(tab3)
@@ -206,6 +209,111 @@ class StockGui(tk.Tk):
         status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
         self._apply_theme()
+
+    # ── Tab 0 — Dashboard ─────────────────────────────────────────────────────
+
+    def _build_tab_dashboard(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(0, weight=1)
+
+        # Ventas de hoy
+        ventas_lf = ttk.LabelFrame(frame, text="  Ventas de hoy  ", padding=10)
+        ventas_lf.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        ventas_lf.columnconfigure(1, weight=1)
+
+        self._dash_total_var = tk.StringVar(value="$0.00")
+        self._dash_count_var = tk.StringVar(value="0 ventas")
+        self._dash_pagos_var = tk.StringVar(value="Sin ventas registradas")
+
+        ttk.Label(ventas_lf, textvariable=self._dash_total_var,
+                  style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(ventas_lf, textvariable=self._dash_count_var).grid(row=0, column=1, sticky="e")
+        lbl_pagos = ttk.Label(ventas_lf, textvariable=self._dash_pagos_var)
+        lbl_pagos.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._muted_labels.append(lbl_pagos)
+
+        # Alertas de stock
+        stock_lf = ttk.LabelFrame(frame, text="  Alertas de stock  ", padding=10)
+        stock_lf.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        stock_lf.columnconfigure(0, weight=1)
+
+        self._dash_alert_var = tk.StringVar(value="✅ Sin alertas")
+        ttk.Label(stock_lf, textvariable=self._dash_alert_var).grid(
+            row=0, column=0, sticky="w", pady=(0, 6)
+        )
+
+        self._dash_stock_list = ttk.Treeview(
+            stock_lf,
+            columns=("codigo", "nombre", "stock"),
+            show="headings",
+            height=6,
+            selectmode="none",
+        )
+        self._dash_stock_list.heading("codigo", text="Código", anchor="center")
+        self._dash_stock_list.heading("nombre", text="Nombre", anchor="center")
+        self._dash_stock_list.heading("stock", text="Stock", anchor="center")
+        self._dash_stock_list.column("codigo", width=110, anchor="center")
+        self._dash_stock_list.column("nombre", width=280, anchor="center")
+        self._dash_stock_list.column("stock", width=70, anchor="center")
+        self._dash_stock_list.grid(row=1, column=0, sticky="ew")
+
+        # Acceso rápido
+        quick_lf = ttk.LabelFrame(frame, text="  Acceso rápido  ", padding=10)
+        quick_lf.grid(row=2, column=0, sticky="ew")
+
+        ttk.Button(
+            quick_lf, text="🧾 Nueva venta  (F1)",
+            command=lambda: (
+                self._notebook.select(1),
+                self.after(50, self._venta_codigo_entry.focus_set),
+            ),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            quick_lf, text="🔍 Buscar producto",
+            command=lambda: (
+                self._notebook.select(1),
+                self.after(50, self._product_search_entry.focus_set),
+            ),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            quick_lf, text="📦 Nuevo producto  (F2)",
+            command=lambda: (
+                self._notebook.select(1),
+                self.after(80, self._toggle_form),
+            ),
+        ).pack(side="left")
+
+    def _refresh_dashboard(self) -> None:
+        summary = stock_app.get_daily_summary(self.conn)
+        breakdown = stock_app.get_payment_breakdown(self.conn)
+
+        self._dash_total_var.set(f"${summary['total']:.2f}")
+        count = summary["count"]
+        self._dash_count_var.set(f"{count} venta{'s' if count != 1 else ''}")
+        if breakdown:
+            pagos = "  |  ".join(
+                f"{r['forma_pago']}: ${float(r['total']):.2f}" for r in breakdown
+            )
+            self._dash_pagos_var.set(pagos)
+        else:
+            self._dash_pagos_var.set("Sin ventas registradas")
+
+        productos = stock_app.search_products(self.conn)
+        criticos = [p for p in productos if p["stock"] <= 0]
+        bajos = [p for p in productos if 0 < p["stock"] < p["stock_minimo"]]
+
+        if criticos or bajos:
+            self._dash_alert_var.set(
+                f"🔴 {len(criticos)} sin stock   |   🟡 {len(bajos)} bajo mínimo"
+            )
+        else:
+            self._dash_alert_var.set("✅ Sin alertas de stock")
+
+        clear_table(self._dash_stock_list)
+        for p in (criticos + bajos)[:10]:
+            self._dash_stock_list.insert(
+                "", "end",
+                values=(p["codigo"], p["nombre"], p["stock"]),
+            )
 
     # ── Tab 1 ─────────────────────────────────────────────────────────────────
 
@@ -348,7 +456,8 @@ class StockGui(tk.Tk):
         search_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         search_row.columnconfigure(1, weight=1)
         ttk.Label(search_row, text="Buscar:").grid(row=0, column=0, padx=(0, 6))
-        ttk.Entry(search_row, textvariable=self.search_var).grid(row=0, column=1, sticky="ew")
+        self._product_search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        self._product_search_entry.grid(row=0, column=1, sticky="ew")
 
         cols = ("codigo", "nombre", "precio", "margen", "stock", "minimo", "proveedor")
         self.products_table = ttk.Treeview(frame, columns=cols, show="headings", height=11)
@@ -806,11 +915,15 @@ class StockGui(tk.Tk):
 
     def _on_tab_changed(self, _=None) -> None:
         idx = self._notebook.index("current")
-        if idx == 1:
-            self.refresh_price_table()
+        if idx == 0:
+            self._refresh_dashboard()
+        elif idx == 1:
+            self.after(50, self._venta_codigo_entry.focus_set)
         elif idx == 2:
-            self.refresh_ventas()
+            self.refresh_price_table()
         elif idx == 3:
+            self.refresh_ventas()
+        elif idx == 4:
             self._refresh_price_history()
 
     # =========================================================================
@@ -2440,10 +2553,11 @@ class StockGui(tk.Tk):
         self.refresh_pending()
         self.caja_var.set(f"Caja de hoy: ${stock_app.daily_cash(self.conn):.2f}")
         self._update_ventas_summary()
+        self._refresh_dashboard()
         idx = self._notebook.index("current")
-        if idx == 1:
+        if idx == 2:
             self.refresh_price_table()
-        elif idx == 2:
+        elif idx == 3:
             self.refresh_ventas()
 
     def refresh_products(self) -> None:
@@ -2634,7 +2748,7 @@ class StockGui(tk.Tk):
 
         total_valid = len(result.rows_new) + len(result.rows_clean) + len(result.rows_conflict)
         if total_valid == 0:
-            messagebox.showinfo("Sin datos", "El CSV no contiene filas válidas.")
+            self._set_status("Sin datos: el CSV no contiene filas válidas.")
             return
 
         # Apply rows without price conflict immediately
@@ -2652,31 +2766,57 @@ class StockGui(tk.Tk):
                 lines.append(f"  ... y {len(result.skipped) - 5} más")
             return "\n\nFilas ignoradas:\n" + "\n".join(lines)
 
-        def _on_conflicts_done() -> None:
-            self.refresh_all()
+        def _build_summary(with_conflicts: bool) -> tuple[str, bool]:
+            """Devuelve (texto_resumen, tiene_detalles_largos)."""
             parts = []
             if n_new > 0:
-                parts.append(f"{n_new} producto(s) nuevo(s)")
+                parts.append(f"{n_new} nuevo(s)")
             if n_clean > 0:
-                parts.append(f"{n_clean} producto(s) con stock actualizado")
-            if result.rows_conflict:
+                parts.append(f"{n_clean} actualizado(s)")
+            if with_conflicts and result.rows_conflict:
                 parts.append(f"{len(result.rows_conflict)} conflicto(s) resuelto(s)")
             if errors:
                 parts.append(f"{len(errors)} error(es)")
-            summary = "\n".join(parts) if parts else "Sin cambios"
-            messagebox.showinfo("Importación completada", summary + _skipped_detail())
+            text = ", ".join(parts) if parts else "Sin cambios"
+            return text, bool(errors or result.skipped)
+
+        def _on_conflicts_done() -> None:
+            self.refresh_all()
+            summary, has_detail = _build_summary(with_conflicts=True)
+            if has_detail:
+                parts_full = []
+                if n_new > 0:
+                    parts_full.append(f"{n_new} producto(s) nuevo(s)")
+                if n_clean > 0:
+                    parts_full.append(f"{n_clean} producto(s) con stock actualizado")
+                if result.rows_conflict:
+                    parts_full.append(f"{len(result.rows_conflict)} conflicto(s) resuelto(s)")
+                if errors:
+                    parts_full.append(f"{len(errors)} error(es)")
+                messagebox.showinfo(
+                    "Importación completada",
+                    "\n".join(parts_full) + _skipped_detail(),
+                )
+            else:
+                self._set_status(f"✓ Importación completada — {summary}")
 
         if not result.rows_conflict:
             self.refresh_all()
-            parts = []
-            if n_new > 0:
-                parts.append(f"{n_new} producto(s) nuevo(s)")
-            if n_clean > 0:
-                parts.append(f"{n_clean} producto(s) con stock actualizado")
-            if errors:
-                parts.append(f"{len(errors)} error(es)")
-            summary = "\n".join(parts) if parts else "Sin cambios"
-            messagebox.showinfo("Importación completada", summary + _skipped_detail())
+            summary, has_detail = _build_summary(with_conflicts=False)
+            if has_detail:
+                parts_full = []
+                if n_new > 0:
+                    parts_full.append(f"{n_new} producto(s) nuevo(s)")
+                if n_clean > 0:
+                    parts_full.append(f"{n_clean} producto(s) con stock actualizado")
+                if errors:
+                    parts_full.append(f"{len(errors)} error(es)")
+                messagebox.showinfo(
+                    "Importación completada",
+                    "\n".join(parts_full) + _skipped_detail(),
+                )
+            else:
+                self._set_status(f"✓ Importación completada — {summary}")
             return
 
         ConflictoDialog(self, result.rows_conflict, self.conn, _on_conflicts_done)
