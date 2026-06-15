@@ -84,7 +84,7 @@ class StockGui(tk.Tk):
         self._hist_search_var = tk.StringVar()
 
         # ── ventas tab vars ──
-        self._ventas_date_var = tk.StringVar(value=date.today().isoformat())
+        self._ventas_date_var = tk.StringVar(value=_date_to_ui(date.today()))
         self._ventas_total_var = tk.StringVar(value="Total del día: $0.00")
         self._ventas_desde_var = tk.StringVar(value="")
         self._ventas_hasta_var = tk.StringVar(value="")
@@ -95,8 +95,8 @@ class StockGui(tk.Tk):
         self._rep_ventas_var = tk.BooleanVar(value=True)
         self._rep_pendientes_var = tk.BooleanVar(value=False)
         self._rep_stock_bajo_var = tk.BooleanVar(value=True)
-        self._rep_desde_var = tk.StringVar(value=date.today().replace(day=1).isoformat())
-        self._rep_hasta_var = tk.StringVar(value=date.today().isoformat())
+        self._rep_desde_var = tk.StringVar(value=_date_to_ui(date.today().replace(day=1)))
+        self._rep_hasta_var = tk.StringVar(value=_date_to_ui(date.today()))
 
         # ── sorting state ──
         self._sort_col: str = ""
@@ -109,6 +109,7 @@ class StockGui(tk.Tk):
         self._cart_mode_active = False
         self._cart: list[dict[str, Any]] = []
         self._undo_stack: list[dict[str, Any]] = []
+        self._redo_stack: list[dict[str, Any]] = []
 
         self._build_layout()
         self.search_var.trace_add("write", lambda *_: self.refresh_products())
@@ -116,6 +117,7 @@ class StockGui(tk.Tk):
         self.venta_codigo_var.trace_add("write", lambda *_: self._update_producto_preview())
         self.refresh_all()
         self.bind("<Control-z>", lambda _: self._undo())
+        self.bind("<Control-y>", lambda _: self._redo())
         # F-key shortcuts
         self.bind("<F1>", lambda _: self._venta_codigo_entry.focus_set())
         self.bind("<F2>", lambda _: self._toggle_form())
@@ -159,16 +161,20 @@ class StockGui(tk.Tk):
             hdr, text="↩ Deshacer (Ctrl+Z)", command=self._undo, state="disabled"
         )
         self._undo_btn.grid(row=0, column=3, padx=(6, 0))
+        self._redo_btn = ttk.Button(
+            hdr, text="↪ Rehacer (Ctrl+Y)", command=self._redo, state="disabled"
+        )
+        self._redo_btn.grid(row=0, column=4, padx=(6, 0))
         self._dark_mode_btn = ttk.Button(
             hdr, text="🌙" if not self._dark_mode else "☀", width=3,
             command=self._toggle_dark_mode,
         )
-        self._dark_mode_btn.grid(row=0, column=4, padx=(6, 0))
+        self._dark_mode_btn.grid(row=0, column=5, padx=(6, 0))
 
         # shortcuts hint
         _shortcuts_lbl = ttk.Label(hdr, text="F1=Venta  F2=Producto  F3=Pendiente",
                                    foreground="gray")
-        _shortcuts_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        _shortcuts_lbl.grid(row=1, column=0, columnspan=6, sticky="w", pady=(2, 0))
         self._muted_labels.append(_shortcuts_lbl)
 
         # notebook
@@ -225,6 +231,9 @@ class StockGui(tk.Tk):
             toggle_row, text="＋ Nuevo producto", command=self._toggle_form
         )
         self._toggle_form_btn.pack(side="left")
+        ttk.Button(
+            toggle_row, text="Importar boleta CSV", command=self._import_boleta_csv
+        ).pack(side="left", padx=(6, 0))
 
         self._build_product_form(left)
         self._build_product_table(left)
@@ -809,28 +818,28 @@ class StockGui(tk.Tk):
     # =========================================================================
 
     def _ventas_go_today(self) -> None:
-        self._ventas_date_var.set(date.today().isoformat())
+        self._ventas_date_var.set(_date_to_ui(date.today()))
         self.refresh_ventas()
 
     def _ventas_prev_day(self) -> None:
         try:
-            d = date.fromisoformat(self._ventas_date_var.get()) - timedelta(days=1)
+            d = _date_from_ui(self._ventas_date_var.get()) - timedelta(days=1)
         except ValueError:
             d = date.today()
-        self._ventas_date_var.set(d.isoformat())
+        self._ventas_date_var.set(_date_to_ui(d))
         self.refresh_ventas()
 
     def _ventas_next_day(self) -> None:
         try:
-            d = date.fromisoformat(self._ventas_date_var.get()) + timedelta(days=1)
+            d = _date_from_ui(self._ventas_date_var.get()) + timedelta(days=1)
         except ValueError:
             d = date.today()
-        self._ventas_date_var.set(d.isoformat())
+        self._ventas_date_var.set(_date_to_ui(d))
         self.refresh_ventas()
 
     def _selected_ventas_date(self) -> date | None:
         try:
-            return date.fromisoformat(self._ventas_date_var.get())
+            return _date_from_ui(self._ventas_date_var.get())
         except ValueError:
             return None
 
@@ -1441,7 +1450,9 @@ class StockGui(tk.Tk):
         running_total = 0.0
         if self._ventas_range_active:
             ventas = stock_app.get_ventas_rango(
-                self.conn, self._ventas_desde_var.get(), self._ventas_hasta_var.get()
+                self.conn,
+                _date_from_ui(self._ventas_desde_var.get()).isoformat(),
+                _date_from_ui(self._ventas_hasta_var.get()).isoformat(),
             )
             for row in ventas:
                 running_total += float(row["total"])
@@ -1484,7 +1495,7 @@ class StockGui(tk.Tk):
     def _update_ventas_summary(self) -> None:
         selected_date = self._selected_ventas_date()
         summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
-        label_date = selected_date.isoformat() if selected_date else date.today().isoformat()
+        label_date = _date_to_ui(selected_date) if selected_date else _date_to_ui(date.today())
         is_today = (selected_date is None or selected_date == date.today())
         prefix = "Hoy" if is_today else label_date
         self._ventas_summary_var.set(
@@ -1505,7 +1516,11 @@ class StockGui(tk.Tk):
         if self._ventas_range_active:
             desde = self._ventas_desde_var.get()
             hasta = self._ventas_hasta_var.get()
-            summary = stock_app.get_range_summary(self.conn, desde, hasta)
+            summary = stock_app.get_range_summary(
+                self.conn,
+                _date_from_ui(desde).isoformat(),
+                _date_from_ui(hasta).isoformat(),
+            )
             breakdown = summary["breakdown"]
             ttk.Label(frame, text="Cierre de rango", font=("Segoe UI", 14, "bold")).pack(anchor="w")
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
@@ -1623,7 +1638,7 @@ class StockGui(tk.Tk):
         self._rep_hasta_entry.grid(row=0, column=3)
 
         hint_lbl = ttk.Label(
-            sec_frame, text="Formato AAAA-MM-DD. Dejá vacío para usar solo la fecha de hoy.",
+            sec_frame, text="Formato DD-MM-AAAA. Dejá vacío para usar solo la fecha de hoy.",
             foreground="gray", font=("Segoe UI", 8),
         )
         hint_lbl.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(2, 10))
@@ -1723,10 +1738,10 @@ class StockGui(tk.Tk):
             hasta_raw = self._rep_hasta_var.get().strip()
             hoy = date.today().isoformat()
             try:
-                desde = date.fromisoformat(desde_raw).isoformat() if desde_raw else hoy
-                hasta = date.fromisoformat(hasta_raw).isoformat() if hasta_raw else hoy
+                desde = _date_from_ui(desde_raw).isoformat() if desde_raw else hoy
+                hasta = _date_from_ui(hasta_raw).isoformat() if hasta_raw else hoy
             except ValueError:
-                messagebox.showerror("Error", "Fechas inválidas en la sección Ventas.\nUsá el formato AAAA-MM-DD.")
+                messagebox.showerror("Error", "Fechas inválidas en la sección Ventas.\nUsá el formato DD-MM-AAAA.")
                 return
 
             ventas = stock_app.get_ventas_rango(self.conn, desde, hasta)
@@ -1836,33 +1851,78 @@ class StockGui(tk.Tk):
         self._undo_stack.append(action)
         if len(self._undo_stack) > _UNDO_MAX:
             self._undo_stack.pop(0)
-        self._undo_btn.configure(
-            state="normal",
-            text=f"↩ Deshacer: {action['description'][:40]}",
-        )
+        self._redo_stack.clear()
+        self._update_undo_redo_btns()
+
+    def _update_undo_redo_btns(self) -> None:
+        if self._undo_stack:
+            self._undo_btn.configure(
+                state="normal",
+                text=f"↩ Deshacer: {self._undo_stack[-1]['description'][:35]}",
+            )
+        else:
+            self._undo_btn.configure(state="disabled", text="↩ Deshacer (Ctrl+Z)")
+        if self._redo_stack:
+            self._redo_btn.configure(
+                state="normal",
+                text=f"↪ Rehacer: {self._redo_stack[-1]['description'][:35]}",
+            )
+        else:
+            self._redo_btn.configure(state="disabled", text="↪ Rehacer (Ctrl+Y)")
 
     def _undo(self) -> None:
         if not self._undo_stack:
             return
         action = self._undo_stack.pop()
         cart_action_handled = False
+        redo_entry: dict[str, Any] | None = None
+
         try:
             if action["type"] == "delete_product":
                 stock_app._restore_product(self.conn, action["data"])
+                redo_entry = {
+                    "type": "redo_delete",
+                    "codigo": action["data"]["codigo"],
+                    "nombre": action["data"]["nombre"],
+                    "description": f"eliminar '{action['data']['nombre']}'",
+                }
+
             elif action["type"] == "sale":
+                sale_id = action.get("sale_id")
+                sale_data: dict | None = None
+                if sale_id is not None:
+                    try:
+                        row = stock_app.get_sale(self.conn, sale_id)
+                        sale_data = dict(row)
+                    except stock_app.StockError:
+                        pass
                 stock_app.reverse_sale(
                     self.conn,
                     action["codigo"],
                     action["cantidad"],
                     action["total"],
                     action["sale_date"],
-                    sale_id=action.get("sale_id"),
+                    sale_id=sale_id,
                 )
+                if sale_data:
+                    redo_entry = {
+                        "type": "redo_sale",
+                        "sale_data": sale_data,
+                        "description": action["description"],
+                    }
+
             elif action["type"] == "price_increase":
                 stock_app.restore_prices(self.conn, action["changes"])
+                redo_entry = {
+                    "type": "redo_price_increase",
+                    "changes": action["changes"],
+                    "description": action["description"],
+                }
+
             elif action["type"] == "cart_change":
                 idx = self._find_cart_item_index(action["codigo"])
                 previous_quantity = int(action.get("previous_quantity", 0))
+                new_quantity = int(action.get("new_quantity", 0))
                 if previous_quantity <= 0:
                     if idx != -1:
                         self._cart.pop(idx)
@@ -1870,6 +1930,15 @@ class StockGui(tk.Tk):
                     self._cart[idx]["cantidad"] = previous_quantity
                     self._cart[idx]["subtotal"] = previous_quantity * self._cart[idx]["precio_unit"]
                 cart_action_handled = True
+                redo_entry = {
+                    "type": "cart_change",
+                    "codigo": action["codigo"],
+                    "previous_quantity": new_quantity,
+                    "new_quantity": previous_quantity,
+                    "previous_item": action.get("previous_item"),
+                    "description": f"rehacer {action['description']}",
+                }
+
             elif action["type"] == "cart_remove":
                 item = dict(action["item"])
                 index = int(action.get("index", len(self._cart)))
@@ -1877,24 +1946,142 @@ class StockGui(tk.Tk):
                     index = len(self._cart)
                 self._cart.insert(index, item)
                 cart_action_handled = True
+                redo_entry = {
+                    "type": "redo_cart_remove",
+                    "codigo": item["codigo"],
+                    "description": f"rehacer quitar '{item['codigo']}'",
+                }
+
             elif action["type"] == "cart_clear":
                 self._cart = [dict(item) for item in action.get("items", [])]
                 cart_action_handled = True
+                redo_entry = {
+                    "type": "redo_cart_clear",
+                    "description": "rehacer vaciar carrito",
+                }
+
         except Exception as exc:
             messagebox.showerror("Error al deshacer", str(exc))
             return
 
+        if redo_entry:
+            self._redo_stack.append(redo_entry)
+
         if cart_action_handled:
             self._refresh_cart_display()
 
-        if not self._undo_stack:
-            self._undo_btn.configure(state="disabled", text="↩ Deshacer (Ctrl+Z)")
-        else:
-            self._undo_btn.configure(
-                text=f"↩ Deshacer: {self._undo_stack[-1]['description'][:40]}"
-            )
+        self._update_undo_redo_btns()
         self.refresh_all()
         self._set_status(f"↩ Revertido: {action.get('description', '')}")
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            return
+        action = self._redo_stack.pop()
+        cart_action_handled = False
+        undo_entry: dict[str, Any] | None = None
+
+        try:
+            if action["type"] == "redo_delete":
+                codigo = action["codigo"]
+                try:
+                    product = stock_app.get_product(self.conn, codigo)
+                    undo_data = {k: product[k] for k in product.keys()}
+                    stock_app.delete_product(self.conn, codigo)
+                    undo_entry = {
+                        "type": "delete_product",
+                        "data": undo_data,
+                        "description": f"eliminacion de '{undo_data['nombre']}'",
+                    }
+                except stock_app.ProductNotFoundError as exc:
+                    messagebox.showerror("Error al rehacer", str(exc))
+                    self._redo_stack.clear()
+                    self._update_undo_redo_btns()
+                    return
+
+            elif action["type"] == "redo_sale":
+                sale_data = action["sale_data"]
+                stock_app.restore_sale(self.conn, sale_data)
+                undo_entry = {
+                    "type": "sale",
+                    "codigo": sale_data["codigo"],
+                    "cantidad": sale_data["cantidad"],
+                    "total": sale_data["total"],
+                    "sale_id": sale_data["id"],
+                    "sale_date": sale_data["fecha"],
+                    "description": action["description"],
+                }
+
+            elif action["type"] == "redo_price_increase":
+                stock_app.re_apply_prices(self.conn, action["changes"])
+                undo_entry = {
+                    "type": "price_increase",
+                    "changes": action["changes"],
+                    "description": action["description"],
+                }
+
+            elif action["type"] == "cart_change":
+                codigo = action["codigo"]
+                new_quantity = int(action.get("new_quantity", 0))
+                previous_quantity = int(action.get("previous_quantity", 0))
+                idx = self._find_cart_item_index(codigo)
+                if previous_quantity <= 0:
+                    if idx != -1:
+                        self._cart.pop(idx)
+                elif idx == -1:
+                    prev_item = action.get("previous_item")
+                    if prev_item:
+                        self._cart.append(dict(prev_item))
+                else:
+                    self._cart[idx]["cantidad"] = previous_quantity
+                    self._cart[idx]["subtotal"] = previous_quantity * self._cart[idx]["precio_unit"]
+                cart_action_handled = True
+                undo_entry = {
+                    "type": "cart_change",
+                    "codigo": codigo,
+                    "previous_quantity": new_quantity,
+                    "new_quantity": previous_quantity,
+                    "description": action["description"],
+                }
+
+            elif action["type"] == "redo_cart_remove":
+                codigo = action["codigo"]
+                idx = self._find_cart_item_index(codigo)
+                if idx != -1:
+                    item = dict(self._cart.pop(idx))
+                    undo_entry = {
+                        "type": "cart_remove",
+                        "item": item,
+                        "index": idx,
+                        "description": f"quitar carrito '{codigo}'",
+                    }
+                cart_action_handled = True
+
+            elif action["type"] == "redo_cart_clear":
+                if self._cart:
+                    undo_entry = {
+                        "type": "cart_clear",
+                        "items": [dict(item) for item in self._cart],
+                        "description": f"vaciar carrito ({len(self._cart)})",
+                    }
+                self._cart.clear()
+                cart_action_handled = True
+
+        except Exception as exc:
+            messagebox.showerror("Error al rehacer", str(exc))
+            return
+
+        if undo_entry:
+            self._undo_stack.append(undo_entry)
+            if len(self._undo_stack) > _UNDO_MAX:
+                self._undo_stack.pop(0)
+
+        if cart_action_handled:
+            self._refresh_cart_display()
+
+        self._update_undo_redo_btns()
+        self.refresh_all()
+        self._set_status(f"↪ Rehecho: {action.get('description', '')}")
 
     # =========================================================================
     # Form helpers
@@ -1986,16 +2173,16 @@ class StockGui(tk.Tk):
         if not desde or not hasta:
             messagebox.showerror(
                 "Fechas requeridas",
-                "Ingresá ambas fechas en formato YYYY-MM-DD.",
+                "Ingresá ambas fechas en formato DD-MM-AAAA.",
             )
             return
         try:
-            date.fromisoformat(desde)
-            date.fromisoformat(hasta)
+            d_desde = _date_from_ui(desde)
+            d_hasta = _date_from_ui(hasta)
         except ValueError:
-            messagebox.showerror("Formato inválido", "Usá el formato YYYY-MM-DD.")
+            messagebox.showerror("Formato inválido", "Usá el formato DD-MM-AAAA.")
             return
-        if desde > hasta:
+        if d_desde > d_hasta:
             messagebox.showerror("Rango inválido", "La fecha 'Desde' debe ser anterior a 'Hasta'.")
             return
         self._ventas_range_active = True
@@ -2427,6 +2614,340 @@ class StockGui(tk.Tk):
         self.conn.close()
         self.destroy()
 
+    # =========================================================================
+    # Importar boleta CSV
+    # =========================================================================
+
+    def _import_boleta_csv(self) -> None:
+        filepath = filedialog.askopenfilename(
+            title="Seleccionar boleta CSV",
+            filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            result = stock_app.parse_and_classify_boleta(self.conn, Path(filepath))
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error al leer CSV", str(exc))
+            return
+
+        total_valid = len(result.rows_new) + len(result.rows_clean) + len(result.rows_conflict)
+        if total_valid == 0:
+            messagebox.showinfo("Sin datos", "El CSV no contiene filas válidas.")
+            return
+
+        # Apply rows without price conflict immediately
+        n_new = len(result.rows_new)
+        n_clean = len(result.rows_clean)
+        errors: list[str] = []
+        if result.rows_new or result.rows_clean:
+            _, errors = stock_app.apply_boleta_batch(self.conn, result.rows_new + result.rows_clean)
+
+        def _skipped_detail() -> str:
+            if not result.skipped:
+                return ""
+            lines = [f"  Línea {ln}: {reason}" for ln, reason in result.skipped[:5]]
+            if len(result.skipped) > 5:
+                lines.append(f"  ... y {len(result.skipped) - 5} más")
+            return "\n\nFilas ignoradas:\n" + "\n".join(lines)
+
+        def _on_conflicts_done() -> None:
+            self.refresh_all()
+            parts = []
+            if n_new > 0:
+                parts.append(f"{n_new} producto(s) nuevo(s)")
+            if n_clean > 0:
+                parts.append(f"{n_clean} producto(s) con stock actualizado")
+            if result.rows_conflict:
+                parts.append(f"{len(result.rows_conflict)} conflicto(s) resuelto(s)")
+            if errors:
+                parts.append(f"{len(errors)} error(es)")
+            summary = "\n".join(parts) if parts else "Sin cambios"
+            messagebox.showinfo("Importación completada", summary + _skipped_detail())
+
+        if not result.rows_conflict:
+            self.refresh_all()
+            parts = []
+            if n_new > 0:
+                parts.append(f"{n_new} producto(s) nuevo(s)")
+            if n_clean > 0:
+                parts.append(f"{n_clean} producto(s) con stock actualizado")
+            if errors:
+                parts.append(f"{len(errors)} error(es)")
+            summary = "\n".join(parts) if parts else "Sin cambios"
+            messagebox.showinfo("Importación completada", summary + _skipped_detail())
+            return
+
+        ConflictoDialog(self, result.rows_conflict, self.conn, _on_conflicts_done)
+
+
+# =============================================================================
+# Conflict resolution dialog
+# =============================================================================
+
+class ConflictoDialog:
+    def __init__(
+        self,
+        parent: StockGui,
+        conflicts: list,
+        conn: sqlite3.Connection,
+        on_complete: object,
+    ) -> None:
+        self._parent = parent
+        self._conflicts = conflicts
+        self._conn = conn
+        self._on_complete = on_complete
+        self._current_idx = 0
+
+        self._dialog = tk.Toplevel(parent)
+        self._dialog.title("Conflicto de precios")
+        self._dialog.resizable(False, False)
+        self._dialog.transient(parent)
+        self._dialog.grab_set()
+        self._dialog.protocol("WM_DELETE_WINDOW", lambda: self._dialog.destroy())
+
+        self._title_var = tk.StringVar()
+        self._nombre_var = tk.StringVar()
+        self._proveedor_var = tk.StringVar()
+        self._pc_actual_var = tk.StringVar()
+        self._pc_nuevo_var = tk.StringVar()
+        self._pv_actual_var = tk.StringVar()
+        self._pv_nuevo_var = tk.StringVar()
+        self._opcion_var = tk.StringVar(value="keep")
+        self._pct_var = tk.StringVar()
+        self._preview_var = tk.StringVar()
+
+        self._build_layout()
+        self._load_conflict(0)
+        parent._center_dialog(self._dialog)
+
+    def _build_layout(self) -> None:
+        outer = ttk.Frame(self._dialog, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, textvariable=self._title_var, style="Bold.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        info = ttk.LabelFrame(outer, text="Datos del producto", padding=10)
+        info.pack(fill="x", pady=(0, 10))
+        info.columnconfigure(1, weight=1)
+        info.columnconfigure(3, weight=1)
+
+        ttk.Label(info, text="Producto:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(info, textvariable=self._nombre_var, style="Bold.TLabel").grid(
+            row=0, column=1, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(info, text="Proveedor boleta:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(info, textvariable=self._proveedor_var).grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=(0, 8)
+        )
+        ttk.Label(info, text="").grid(row=2, column=0)
+        ttk.Label(info, text="Actual", style="Bold.TLabel").grid(row=2, column=1, sticky="w")
+        ttk.Label(info, text="En la boleta", style="Bold.TLabel").grid(
+            row=2, column=2, sticky="w", padx=(24, 0)
+        )
+        ttk.Label(info, text="Precio costo:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(info, textvariable=self._pc_actual_var).grid(row=3, column=1, sticky="w")
+        ttk.Label(info, textvariable=self._pc_nuevo_var).grid(
+            row=3, column=2, sticky="w", padx=(24, 0)
+        )
+        ttk.Label(info, text="Precio venta:").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=(4, 0)
+        )
+        ttk.Label(info, textvariable=self._pv_actual_var).grid(
+            row=4, column=1, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(info, textvariable=self._pv_nuevo_var).grid(
+            row=4, column=2, sticky="w", padx=(24, 0), pady=(4, 0)
+        )
+
+        opt = ttk.LabelFrame(outer, text="Decisión para este producto", padding=10)
+        opt.pack(fill="x", pady=(0, 10))
+
+        ttk.Radiobutton(
+            opt, text="Mantener precio actual",
+            variable=self._opcion_var, value="keep",
+            command=self._on_opcion_changed,
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            opt, text="Actualizar precio (usar precio de la boleta)",
+            variable=self._opcion_var, value="update",
+            command=self._on_opcion_changed,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Radiobutton(
+            opt, text="Modificar % del precio de venta:",
+            variable=self._opcion_var, value="porcentaje",
+            command=self._on_opcion_changed,
+        ).pack(anchor="w", pady=(4, 0))
+
+        pct_row = ttk.Frame(opt)
+        pct_row.pack(fill="x", padx=(20, 0), pady=(2, 0))
+        ttk.Label(pct_row, text="Porcentaje:").pack(side="left", padx=(0, 4))
+        self._pct_entry = ttk.Entry(pct_row, textvariable=self._pct_var, width=10, state="disabled")
+        self._pct_entry.pack(side="left", padx=(0, 4))
+        ttk.Label(pct_row, text="%").pack(side="left", padx=(0, 12))
+        ttk.Label(pct_row, textvariable=self._preview_var, foreground="gray").pack(side="left")
+
+        self._pct_var.trace_add("write", self._on_pct_changed)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill="x", pady=(4, 0))
+        self._confirmar_btn = ttk.Button(btn_row, text="Confirmar", command=self._confirmar)
+        self._confirmar_btn.pack(side="right", padx=(8, 0))
+        ttk.Button(
+            btn_row, text="Aplicar a todos los restantes igual",
+            command=self._aplicar_a_todos,
+        ).pack(side="right")
+
+    def _load_conflict(self, idx: int) -> None:
+        row, db_row = self._conflicts[idx]
+        total = len(self._conflicts)
+        self._title_var.set(f"Conflicto de precios ({idx + 1} de {total})")
+        self._nombre_var.set(db_row["nombre"])
+        self._proveedor_var.set(row.proveedor or "(no especificado)")
+        self._pc_actual_var.set(f"${float(db_row['precio_costo']):.2f}")
+        self._pc_nuevo_var.set(
+            f"${row.precio_costo:.2f}" if row.precio_costo is not None else "—"
+        )
+        self._pv_actual_var.set(f"${float(db_row['precio']):.2f}")
+        self._pv_nuevo_var.set(
+            f"${row.precio_venta:.2f}" if row.precio_venta is not None else "—"
+        )
+        self._opcion_var.set("keep")
+        self._pct_var.set("")
+        self._preview_var.set("")
+        self._pct_entry.configure(state="disabled")
+        self._confirmar_btn.configure(state="normal")
+
+    def _on_opcion_changed(self) -> None:
+        if self._opcion_var.get() == "porcentaje":
+            self._pct_entry.configure(state="normal")
+            self._pct_entry.focus_set()
+        else:
+            self._pct_entry.configure(state="disabled")
+            self._preview_var.set("")
+            self._confirmar_btn.configure(state="normal")
+
+    def _on_pct_changed(self, *_: Any) -> None:
+        if self._opcion_var.get() != "porcentaje":
+            return
+        idx = self._current_idx
+        if idx >= len(self._conflicts):
+            return
+        _, db_row = self._conflicts[idx]
+        pct_raw = self._pct_var.get().strip()
+        if not pct_raw:
+            self._preview_var.set("")
+            self._confirmar_btn.configure(state="normal")
+            return
+        try:
+            pct = float(pct_raw.replace(",", "."))
+            nuevo = float(db_row["precio"]) * (1 + pct / 100)
+            if nuevo <= 0:
+                self._preview_var.set("⚠ Precio resultante ≤ 0")
+                self._confirmar_btn.configure(state="disabled")
+            else:
+                self._preview_var.set(f"→ ${nuevo:.2f}")
+                self._confirmar_btn.configure(state="normal")
+        except ValueError:
+            self._preview_var.set("⚠ Ingrese un número")
+            self._confirmar_btn.configure(state="disabled")
+
+    def _resolve_overrides(
+        self, row: Any, db_row: sqlite3.Row
+    ) -> tuple[float | None, float | None] | None:
+        """Returns (pv_override, pc_override) for the current option, or None on validation error."""
+        opcion = self._opcion_var.get()
+        if opcion == "keep":
+            return float(db_row["precio"]), float(db_row["precio_costo"])
+        elif opcion == "update":
+            return None, None
+        else:
+            pct_raw = self._pct_var.get().strip().replace(",", ".")
+            try:
+                pct = float(pct_raw)
+                nuevo_pv = float(db_row["precio"]) * (1 + pct / 100)
+                if nuevo_pv <= 0:
+                    messagebox.showerror(
+                        "Precio inválido",
+                        "El porcentaje resulta en un precio ≤ 0.",
+                        parent=self._dialog,
+                    )
+                    return None
+                return nuevo_pv, None
+            except ValueError:
+                messagebox.showerror(
+                    "Valor inválido",
+                    "Ingrese un porcentaje numérico válido.",
+                    parent=self._dialog,
+                )
+                return None
+
+    def _confirmar(self) -> None:
+        idx = self._current_idx
+        row, db_row = self._conflicts[idx]
+        overrides = self._resolve_overrides(row, db_row)
+        if overrides is None:
+            return
+        pv_override, pc_override = overrides
+        try:
+            stock_app.apply_boleta_row(
+                self._conn, row,
+                precio_venta_override=pv_override,
+                precio_costo_override=pc_override,
+            )
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error", str(exc), parent=self._dialog)
+            return
+        self._current_idx += 1
+        if self._current_idx < len(self._conflicts):
+            self._load_conflict(self._current_idx)
+        else:
+            self._finish()
+
+    def _aplicar_a_todos(self) -> None:
+        opcion = self._opcion_var.get()
+        pct = 0.0
+        if opcion == "porcentaje":
+            try:
+                pct = float(self._pct_var.get().strip().replace(",", "."))
+            except ValueError:
+                messagebox.showerror(
+                    "Valor inválido",
+                    "Ingrese un porcentaje numérico válido.",
+                    parent=self._dialog,
+                )
+                return
+
+        for idx in range(self._current_idx, len(self._conflicts)):
+            row, db_row = self._conflicts[idx]
+            if opcion == "keep":
+                pv_override: float | None = float(db_row["precio"])
+                pc_override: float | None = float(db_row["precio_costo"])
+            elif opcion == "update":
+                pv_override = None
+                pc_override = None
+            else:
+                nuevo_pv = float(db_row["precio"]) * (1 + pct / 100)
+                pv_override = max(nuevo_pv, 0.01)
+                pc_override = None
+            try:
+                stock_app.apply_boleta_row(
+                    self._conn, row,
+                    precio_venta_override=pv_override,
+                    precio_costo_override=pc_override,
+                )
+            except stock_app.StockError:
+                pass
+
+        self._finish()
+
+    def _finish(self) -> None:
+        self._dialog.destroy()
+        self._on_complete()
+
 
 # =============================================================================
 # Module-level helpers
@@ -2461,6 +2982,14 @@ def parse_int(value: str, field_name: str) -> int:
     if number < 0:
         raise ValueError(f"{field_name.capitalize()} no puede ser negativo.")
     return number
+
+
+def _date_to_ui(d: date) -> str:
+    return d.strftime("%d-%m-%Y")
+
+
+def _date_from_ui(s: str) -> date:
+    return datetime.strptime(s.strip(), "%d-%m-%Y").date()
 
 
 def main() -> None:

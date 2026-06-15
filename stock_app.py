@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import json
 import logging
 import shutil
@@ -49,6 +50,24 @@ class ProductNotFoundError(StockError):
 
 class InsufficientStockError(StockError):
     pass
+
+
+@dataclass
+class BoletaRow:
+    codigo: str
+    nombre: str
+    cantidad: int
+    precio_costo: float | None = None
+    precio_venta: float | None = None
+    proveedor: str | None = None
+
+
+@dataclass
+class BoletaResult:
+    rows_new: list
+    rows_clean: list
+    rows_conflict: list
+    skipped: list
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -271,6 +290,7 @@ def update_product(
     proveedor: str = "",
     precio_costo: float = 0.0,
     notas: str = "",
+    motivo: str = "Edición manual",
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
@@ -315,7 +335,7 @@ def update_product(
                 (codigo, proveedor.strip(), float(precio_costo)),
             )
         if float(row["precio"]) != precio:
-            log_price_change(conn, codigo, nombre, float(row["precio"]), precio, "Edición manual")
+            log_price_change(conn, codigo, nombre, float(row["precio"]), precio, motivo)
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise StockError(f"No se pudo actualizar el producto: {exc}") from exc
@@ -839,6 +859,204 @@ def export_ventas_csv(conn: sqlite3.Connection, dest_path: Path, cash_date: date
             writer.writerow([row["hora"], row["codigo"], row["nombre"],
                              row["cantidad"], row["precio_unit"], row["total"]])
     return len(rows)
+
+
+# ── Boleta CSV import ─────────────────────────────────────────────────────────
+
+def parse_and_classify_boleta(conn: sqlite3.Connection, path: Path) -> BoletaResult:
+    """Parses a supplier boleta CSV and classifies rows as new, clean-update, or price-conflict."""
+    result = BoletaResult(rows_new=[], rows_clean=[], rows_conflict=[], skipped=[])
+    required_cols = {"codigo", "nombre", "cantidad"}
+
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = set(reader.fieldnames or [])
+            if not required_cols.issubset(fieldnames):
+                missing = required_cols - fieldnames
+                raise StockError(
+                    f"CSV inválido: faltan columnas requeridas: {', '.join(sorted(missing))}"
+                )
+
+            for line_num, raw in enumerate(reader, start=2):
+                codigo = raw.get("codigo", "").strip()
+                nombre = raw.get("nombre", "").strip()
+
+                if not codigo or not nombre:
+                    result.skipped.append((line_num, "codigo o nombre vacío"))
+                    continue
+
+                try:
+                    cantidad = int(raw.get("cantidad", "").strip())
+                    if cantidad <= 0:
+                        raise ValueError
+                except (ValueError, AttributeError):
+                    result.skipped.append((line_num, "cantidad inválida"))
+                    continue
+
+                skip_row = False
+                precio_costo: float | None = None
+                precio_venta: float | None = None
+
+                for key in ("precio_costo", "precio_venta"):
+                    raw_val = raw.get(key, "").strip()
+                    if raw_val:
+                        try:
+                            val = float(raw_val.replace(",", "."))
+                            if val < 0:
+                                result.skipped.append((line_num, f"{key} no puede ser negativo"))
+                                skip_row = True
+                                break
+                            if key == "precio_costo":
+                                precio_costo = val
+                            else:
+                                precio_venta = val
+                        except ValueError:
+                            result.skipped.append((line_num, f"{key} inválido: '{raw_val}'"))
+                            skip_row = True
+                            break
+
+                if skip_row:
+                    continue
+
+                proveedor = raw.get("proveedor", "").strip() or None
+                row = BoletaRow(
+                    codigo=codigo, nombre=nombre, cantidad=cantidad,
+                    precio_costo=precio_costo, precio_venta=precio_venta, proveedor=proveedor,
+                )
+
+                try:
+                    db_row = get_product(conn, codigo)
+                    has_conflict = (
+                        (precio_costo is not None
+                         and abs(precio_costo - float(db_row["precio_costo"])) > 0.001)
+                        or (precio_venta is not None
+                            and abs(precio_venta - float(db_row["precio"])) > 0.001)
+                    )
+                    if has_conflict:
+                        result.rows_conflict.append((row, db_row))
+                    else:
+                        result.rows_clean.append(row)
+                except ProductNotFoundError:
+                    result.rows_new.append(row)
+
+    except UnicodeDecodeError as exc:
+        raise StockError(
+            "El archivo no es UTF-8. Guardalo como UTF-8 desde Excel o el programa que lo genera."
+        ) from exc
+
+    return result
+
+
+def apply_boleta_row(
+    conn: sqlite3.Connection,
+    row: BoletaRow,
+    precio_venta_override: float | None = None,
+    precio_costo_override: float | None = None,
+) -> None:
+    """Applies one boleta row: creates the product if new, or updates stock and prices if existing."""
+    try:
+        db_row = get_product(conn, row.codigo)
+    except ProductNotFoundError:
+        precio = precio_venta_override if precio_venta_override is not None else (row.precio_venta or 0.0)
+        costo = precio_costo_override if precio_costo_override is not None else (row.precio_costo or 0.0)
+        add_product(conn, row.codigo, row.nombre, precio, row.cantidad, 0, row.proveedor or "", costo, "")
+        return
+
+    nuevo_stock = int(db_row["stock"]) + row.cantidad
+
+    if precio_venta_override is not None:
+        final_precio = precio_venta_override
+    elif row.precio_venta is not None:
+        final_precio = row.precio_venta
+    else:
+        final_precio = float(db_row["precio"])
+
+    if precio_costo_override is not None:
+        final_costo = precio_costo_override
+    elif row.precio_costo is not None:
+        final_costo = row.precio_costo
+    else:
+        final_costo = float(db_row["precio_costo"])
+
+    update_product(
+        conn, row.codigo, db_row["nombre"], final_precio, nuevo_stock,
+        int(db_row["stock_minimo"]), db_row["proveedor"] or "",
+        final_costo, db_row["notas"] or "",
+        motivo="Importación boleta",
+    )
+
+    if row.proveedor:
+        try:
+            add_product_supplier(conn, row.codigo, row.proveedor, row.precio_costo or final_costo)
+        except (StockError, ValueError):
+            pass
+
+
+def apply_boleta_batch(
+    conn: sqlite3.Connection,
+    rows: list,
+) -> tuple[int, list[str]]:
+    """Applies a list of BoletaRow without conflict. Returns (count_ok, errors)."""
+    count = 0
+    errors: list[str] = []
+    for row in rows:
+        try:
+            apply_boleta_row(conn, row)
+            count += 1
+        except StockError as exc:
+            errors.append(f"{row.codigo}: {exc}")
+    return count, errors
+
+
+# ── Redo helpers ──────────────────────────────────────────────────────────────
+
+def get_sale(conn: sqlite3.Connection, sale_id: int) -> sqlite3.Row:
+    """Returns a single sale row by id. Needed to capture data before reverse_sale for redo."""
+    row = conn.execute("SELECT * FROM ventas WHERE id = ?", (sale_id,)).fetchone()
+    if row is None:
+        raise StockError(f"No existe una venta con id {sale_id}.")
+    return row
+
+
+def restore_sale(conn: sqlite3.Connection, sale_data: dict) -> None:
+    """Re-inserts a previously reversed sale and decrements stock (redo of a sale undo)."""
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO ventas
+                (id, codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sale_data["id"], sale_data["codigo"], sale_data["nombre"],
+                sale_data["cantidad"], sale_data["precio_unit"], sale_data["total"],
+                sale_data["fecha"], sale_data["hora"], sale_data["forma_pago"],
+                sale_data.get("precio_costo", 0),
+            ),
+        )
+        conn.execute(
+            "UPDATE productos SET stock = stock - ? WHERE codigo = ?",
+            (sale_data["cantidad"], sale_data["codigo"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO caja (fecha, total)
+            VALUES (?, ?)
+            ON CONFLICT(fecha) DO UPDATE SET total = total + excluded.total
+            """,
+            (sale_data["fecha"], sale_data["total"]),
+        )
+
+
+def re_apply_prices(conn: sqlite3.Connection, changes: list[tuple[str, float, float]]) -> None:
+    """Re-applies the new_price for each (codigo, old_price, new_price). Complement of restore_prices."""
+    with conn:
+        for codigo, _, new_price in changes:
+            conn.execute(
+                "UPDATE productos SET precio = ? WHERE codigo = ?",
+                (new_price, codigo),
+            )
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────────
