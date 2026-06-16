@@ -12,7 +12,7 @@ Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de 
 - Operaciones criticas de escritura usan transacciones con `with conn:`.
 - Undo/redo esta encapsulado en `UndoManager`.
 - Generacion de PDF esta encapsulada en `ReportGenerator`.
-- Suite actual: 83 tests con `unittest`.
+- Suite actual: 89 tests con `unittest`.
 
 ## Requisitos
 
@@ -56,10 +56,12 @@ En la primera ejecucion la app crea automaticamente:
 - Caja diaria con total, desglose por forma de pago y ganancia bruta.
 - Historial de cambios de precio con motivo.
 - Aumento masivo de precios con vista previa y undo.
-- Importacion de boletas CSV con formato:
+- Importacion de boletas CSV con proveedor elegido desde la GUI. La columna
+  `proveedor` es opcional y solo se usa si el archivo necesita sobrescribir el
+  proveedor elegido para una fila puntual.
 
 ```csv
-codigo,nombre,cantidad,precio_costo,precio_venta,proveedor
+codigo,nombre,cantidad,precio_costo,precio_venta
 ```
 
 - Resolucion manual de conflictos de precio al importar boletas.
@@ -77,7 +79,7 @@ codigo,nombre,cantidad,precio_costo,precio_venta,proveedor
 python -m unittest -v
 ```
 
-Estado actual: 83 tests pasan.
+Estado actual: 89 tests pasan.
 
 Nota: `pytest` no es requisito del proyecto. Si se quiere usar el comando del plan:
 
@@ -110,3 +112,4 @@ El ejecutable se genera en `dist\SistemaDeStock.exe`.
 - `stock.db`, `config.json`, `stock.log` y `backups/` son artefactos runtime y no deberian versionarse.
 - La app usa fechas ISO en SQLite y `DD-MM-AAAA` en la interfaz.
 - Al borrar un producto, SQLite elimina sus proveedores por cascade; el undo captura esos proveedores para poder restaurarlos.
+- Reimportar la misma boleta no duplica proveedores: actualiza el costo del proveedor existente.

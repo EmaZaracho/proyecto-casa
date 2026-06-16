@@ -2839,6 +2839,77 @@ class StockGui(tk.Tk):
     # Importar boleta CSV
     # =========================================================================
 
+    def _select_boleta_proveedor(self) -> str | None:
+        proveedores = stock_app.get_all_proveedores(self.conn)
+        new_option = "+ Nuevo proveedor..."
+        values = proveedores + [new_option]
+        result: dict[str, str | None] = {"value": None}
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Proveedor de boleta")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        proveedor_var = tk.StringVar(value=proveedores[0] if proveedores else new_option)
+        nuevo_var = tk.StringVar()
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(1, weight=1)
+
+        ttk.Label(outer, text="Proveedor:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        combo = ttk.Combobox(
+            outer,
+            textvariable=proveedor_var,
+            values=values,
+            state="readonly",
+            width=32,
+        )
+        combo.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(outer, text="Nuevo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        nuevo_entry = ttk.Entry(outer, textvariable=nuevo_var, width=34)
+        nuevo_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def _sync_new_entry(*_args: object) -> None:
+            state = "normal" if proveedor_var.get() == new_option else "disabled"
+            nuevo_entry.configure(state=state)
+            if state == "normal":
+                nuevo_entry.focus_set()
+
+        def _accept() -> None:
+            selected = proveedor_var.get().strip()
+            if selected == new_option:
+                selected = nuevo_var.get().strip()
+                if not selected:
+                    messagebox.showerror(
+                        "Proveedor requerido",
+                        "Ingresa el nombre del proveedor nuevo.",
+                        parent=dialog,
+                    )
+                    return
+            result["value"] = selected
+            dialog.destroy()
+
+        def _cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(btn_row, text="Cancelar", command=_cancel).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_row, text="Importar", command=_accept).pack(side="right")
+
+        combo.bind("<<ComboboxSelected>>", _sync_new_entry)
+        nuevo_entry.bind("<Return>", lambda _event: _accept())
+        dialog.bind("<Escape>", lambda _event: _cancel())
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        _sync_new_entry()
+        self._center_dialog(dialog)
+        self.wait_window(dialog)
+        return result["value"]
+
     def _import_boleta_csv(self) -> None:
         filepath = filedialog.askopenfilename(
             title="Seleccionar boleta CSV",
@@ -2847,8 +2918,16 @@ class StockGui(tk.Tk):
         if not filepath:
             return
 
+        proveedor_boleta = self._select_boleta_proveedor()
+        if proveedor_boleta is None:
+            return
+
         try:
-            result = stock_app.parse_and_classify_boleta(self.conn, Path(filepath))
+            result = stock_app.parse_and_classify_boleta(
+                self.conn,
+                Path(filepath),
+                default_proveedor=proveedor_boleta,
+            )
         except stock_app.StockError as exc:
             messagebox.showerror("Error al leer CSV", str(exc))
             return

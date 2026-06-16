@@ -296,6 +296,8 @@ def update_product(
 ) -> None:
     codigo = codigo.strip()
     nombre = nombre.strip()
+    proveedor = proveedor.strip()
+    precio_costo = float(precio_costo)
     row = conn.execute("SELECT precio FROM productos WHERE codigo = ?", (codigo,)).fetchone()
     if row is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
@@ -310,7 +312,7 @@ def update_product(
                 WHERE codigo = ?
                 """,
                 (nombre, precio, stock, stock_minimo,
-                 proveedor.strip(), precio_costo, notas.strip(), codigo),
+                 proveedor, precio_costo, notas.strip(), codigo),
             )
             primary = conn.execute(
                 """
@@ -319,29 +321,90 @@ def update_product(
                 """,
                 (codigo,),
             ).fetchone()
-            if primary and proveedor.strip():
-                conn.execute(
+            if proveedor:
+                existing = conn.execute(
                     """
-                    UPDATE proveedores_producto
-                    SET proveedor = ?, precio_costo = ?
-                    WHERE id = ?
+                    SELECT id FROM proveedores_producto
+                    WHERE codigo = ? AND proveedor = ?
+                    ORDER BY es_principal DESC, id ASC
+                    LIMIT 1
                     """,
-                    (proveedor.strip(), float(precio_costo), primary["id"]),
-                )
+                    (codigo, proveedor),
+                ).fetchone()
+                if existing and (not primary or existing["id"] != primary["id"]):
+                    conn.execute(
+                        "UPDATE proveedores_producto SET es_principal = 0 WHERE codigo = ?",
+                        (codigo,),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE proveedores_producto
+                        SET precio_costo = ?, es_principal = 1
+                        WHERE id = ?
+                        """,
+                        (precio_costo, existing["id"]),
+                    )
+                    if primary:
+                        conn.execute(
+                            "DELETE FROM proveedores_producto WHERE id = ?",
+                            (primary["id"],),
+                        )
+                    conn.execute(
+                        """
+                        DELETE FROM proveedores_producto
+                        WHERE codigo = ? AND proveedor = ? AND id != ?
+                        """,
+                        (codigo, proveedor, existing["id"]),
+                    )
+                elif primary:
+                    conn.execute(
+                        """
+                        UPDATE proveedores_producto
+                        SET proveedor = ?, precio_costo = ?
+                        WHERE id = ?
+                        """,
+                        (proveedor, precio_costo, primary["id"]),
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM proveedores_producto
+                        WHERE codigo = ? AND proveedor = ? AND id != ?
+                        """,
+                        (codigo, proveedor, primary["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO proveedores_producto
+                            (codigo, proveedor, precio_costo, es_principal)
+                        VALUES (?, ?, ?, 1)
+                        """,
+                        (codigo, proveedor, precio_costo),
+                    )
             elif primary:
                 conn.execute(
                     "DELETE FROM proveedores_producto WHERE id = ?",
                     (primary["id"],),
                 )
-            elif proveedor.strip():
-                conn.execute(
+                remaining = conn.execute(
                     """
-                    INSERT INTO proveedores_producto
-                        (codigo, proveedor, precio_costo, es_principal)
-                    VALUES (?, ?, ?, 1)
+                    SELECT id, proveedor, precio_costo
+                    FROM proveedores_producto
+                    WHERE codigo = ?
+                    ORDER BY proveedor ASC, id ASC
+                    LIMIT 1
                     """,
-                    (codigo, proveedor.strip(), float(precio_costo)),
-                )
+                    (codigo,),
+                ).fetchone()
+                if remaining:
+                    conn.execute(
+                        "UPDATE proveedores_producto SET es_principal = 1 WHERE id = ?",
+                        (remaining["id"],),
+                    )
+                    conn.execute(
+                        "UPDATE productos SET proveedor = ?, precio_costo = ? WHERE codigo = ?",
+                        (remaining["proveedor"], float(remaining["precio_costo"]), codigo),
+                    )
             if float(row["precio"]) != precio:
                 log_price_change(conn, codigo, nombre, float(row["precio"]), precio, motivo)
     except sqlite3.IntegrityError as exc:
@@ -350,33 +413,38 @@ def update_product(
 
 def _restore_product(conn: sqlite3.Connection, data: dict) -> None:
     """Re-inserts a previously deleted product row. Used by the undo system."""
-    with conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO productos
-                (codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data["codigo"], data["nombre"], data["precio"],
-                data["stock"], data["stock_minimo"], data["foto"],
-                data["proveedor"], data.get("precio_costo", 0), data.get("notas", ""),
-            ),
-        )
-        for supplier in data.get("suppliers", []):
+    try:
+        with conn:
             conn.execute(
                 """
-                INSERT INTO proveedores_producto
-                    (codigo, proveedor, precio_costo, es_principal)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO productos
+                    (codigo, nombre, precio, stock, stock_minimo, foto, proveedor, precio_costo, notas)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    data["codigo"],
-                    supplier["proveedor"],
-                    float(supplier["precio_costo"]),
-                    int(supplier["es_principal"]),
+                    data["codigo"], data["nombre"], data["precio"],
+                    data["stock"], data["stock_minimo"], data["foto"],
+                    data["proveedor"], data.get("precio_costo", 0), data.get("notas", ""),
                 ),
             )
+            for supplier in data.get("suppliers", []):
+                conn.execute(
+                    """
+                    INSERT INTO proveedores_producto
+                        (codigo, proveedor, precio_costo, es_principal)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        data["codigo"],
+                        supplier["proveedor"],
+                        float(supplier["precio_costo"]),
+                        int(supplier["es_principal"]),
+                    ),
+                )
+    except sqlite3.IntegrityError as exc:
+        raise DuplicateProductError(
+            f"No se pudo restaurar el producto {data['codigo']}: el codigo ya existe."
+        ) from exc
 
 
 def delete_product(conn: sqlite3.Connection, codigo: str) -> None:
@@ -486,6 +554,15 @@ def add_product_supplier(
     if conn.execute("SELECT 1 FROM productos WHERE codigo = ?", (codigo,)).fetchone() is None:
         raise ProductNotFoundError(f"No existe un producto con codigo {codigo}.")
     with conn:
+        existing = conn.execute(
+            """
+            SELECT id, es_principal FROM proveedores_producto
+            WHERE codigo = ? AND proveedor = ?
+            ORDER BY es_principal DESC, id ASC
+            LIMIT 1
+            """,
+            (codigo, proveedor),
+        ).fetchone()
         has_primary = conn.execute(
             """
             SELECT 1 FROM proveedores_producto
@@ -493,6 +570,35 @@ def add_product_supplier(
             """,
             (codigo,),
         ).fetchone()
+        if existing:
+            is_primary = int(existing["es_principal"])
+            conn.execute(
+                """
+                UPDATE proveedores_producto
+                SET precio_costo = ?
+                WHERE id = ?
+                """,
+                (float(precio_costo), existing["id"]),
+            )
+            conn.execute(
+                """
+                DELETE FROM proveedores_producto
+                WHERE codigo = ? AND proveedor = ? AND id != ?
+                """,
+                (codigo, proveedor, existing["id"]),
+            )
+            if not has_primary:
+                conn.execute(
+                    "UPDATE proveedores_producto SET es_principal = 1 WHERE id = ?",
+                    (existing["id"],),
+                )
+                is_primary = 1
+            if is_primary:
+                conn.execute(
+                    "UPDATE productos SET proveedor = ?, precio_costo = ? WHERE codigo = ?",
+                    (proveedor, float(precio_costo), codigo),
+                )
+            return
         is_primary = 0 if has_primary else 1
         conn.execute(
             """
@@ -884,10 +990,15 @@ def export_ventas_csv(conn: sqlite3.Connection, dest_path: Path, cash_date: date
 
 # ── Boleta CSV import ─────────────────────────────────────────────────────────
 
-def parse_and_classify_boleta(conn: sqlite3.Connection, path: Path) -> BoletaResult:
+def parse_and_classify_boleta(
+    conn: sqlite3.Connection,
+    path: Path,
+    default_proveedor: str | None = None,
+) -> BoletaResult:
     """Parses a supplier boleta CSV and classifies rows as new, clean-update, or price-conflict."""
     result = BoletaResult(rows_new=[], rows_clean=[], rows_conflict=[], skipped=[])
     required_cols = {"codigo", "nombre", "cantidad"}
+    default_proveedor = (default_proveedor or "").strip() or None
 
     try:
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -940,7 +1051,7 @@ def parse_and_classify_boleta(conn: sqlite3.Connection, path: Path) -> BoletaRes
                 if skip_row:
                     continue
 
-                proveedor = raw.get("proveedor", "").strip() or None
+                proveedor = (raw.get("proveedor") or "").strip() or default_proveedor
                 row = BoletaRow(
                     codigo=codigo, nombre=nombre, cantidad=cantidad,
                     precio_costo=precio_costo, precio_venta=precio_venta, proveedor=proveedor,

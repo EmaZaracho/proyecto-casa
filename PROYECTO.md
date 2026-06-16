@@ -20,7 +20,7 @@ App de escritorio para gestion de inventario y punto de venta de un negocio pequ
 
 - Rama de trabajo: `prueba-de-refactorizacion`.
 - Schema actual: v5.
-- Tests actuales: 83 con `python -m unittest -v`.
+- Tests actuales: 89 con `python -m unittest -v`.
 - `pytest` no esta instalado por defecto.
 - Textos visibles de la GUI normalizados a ASCII para evitar mojibake en Windows.
 - Refactor tecnico aplicado:
@@ -146,13 +146,34 @@ Motivo:
 
 Al crear o actualizar productos, si hay proveedor se crea o actualiza el proveedor principal en `proveedores_producto`, incluso si el costo es `0`.
 
-Si un producto se actualiza con proveedor vacio, se elimina el proveedor principal normalizado para evitar registros vacios en combos y listados.
+Si un producto se actualiza con proveedor vacio, se elimina el proveedor principal normalizado para evitar registros vacios en combos y listados. Si quedan proveedores secundarios, se promueve el primero como principal para que el producto no quede con proveedores pero sin principal.
+
+`add_product_supplier()` es idempotente por `codigo + proveedor`: si el proveedor ya existe para el producto, actualiza su costo y no crea una fila duplicada.
 
 Al borrar un producto:
 
 - SQLite borra sus proveedores por cascade;
 - la GUI captura `suppliers` antes de borrar;
-- `_restore_product()` puede reinsertar esos proveedores al deshacer.
+- `_restore_product()` puede reinsertar esos proveedores al deshacer;
+- si el codigo ya fue reutilizado, `_restore_product()` falla con `DuplicateProductError` y no mezcla proveedores del producto viejo con el nuevo.
+
+## Importacion de boletas
+
+La GUI pide el proveedor de la boleta antes de parsear el CSV. El usuario puede elegir un proveedor existente o ingresar uno nuevo.
+
+Formato minimo:
+
+```csv
+codigo,nombre,cantidad
+```
+
+Columnas opcionales:
+
+```csv
+precio_costo,precio_venta,proveedor
+```
+
+Decision actual: `proveedor` en el CSV es opcional. Si no viene o esta vacio, `parse_and_classify_boleta(..., default_proveedor=...)` usa el proveedor elegido en la GUI. Si la columna existe y una fila trae valor, ese valor tiene prioridad sobre el proveedor del dialogo.
 
 ## Funcionalidades implementadas
 
@@ -162,7 +183,7 @@ Al borrar un producto:
 - Alta y edicion de productos.
 - Multi-proveedor por producto.
 - Ajuste directo de stock.
-- Importacion de boleta CSV.
+- Importacion de boleta CSV con proveedor por dialogo.
 - Venta individual y carrito.
 - Alertas de stock bajo.
 - Pendientes internos.
@@ -227,8 +248,11 @@ Los errores criticos siguen usando `logger.exception()`.
 | Mutaciones con `with conn:` | Rollback automatico ante fallos intermedios. |
 | `proveedores_producto` como fuente de proveedores | Evita perder proveedores secundarios. |
 | `productos.proveedor/precio_costo` como cache | Mantiene compatibilidad con vistas y reportes existentes. |
-| Proveedor vacio elimina proveedor principal | Evita registros vacios en `proveedores_producto` y en combos. |
+| Proveedor vacio elimina proveedor principal y promueve secundario si existe | Evita registros vacios y mantiene un unico principal cuando quedan proveedores. |
+| Proveedor repetido actualiza costo sin duplicar | Hace idempotente la importacion de boletas y la carga manual. |
 | Undo de eliminacion captura proveedores | Necesario porque cascade borra `proveedores_producto`. |
+| Restore no usa `INSERT OR IGNORE` | Evita mezclar proveedores si un codigo eliminado fue reutilizado antes del undo. |
+| Proveedor de boleta por dialogo | Permite omitir `proveedor` en el CSV sin perder trazabilidad. |
 | `UndoManager` | Reduce responsabilidad directa de `StockGui`. |
 | `ReportGenerator` | Aisla generacion PDF de la GUI. |
 | Textos visibles ASCII | Evita mojibake en Tkinter/Windows con archivos tocados por distintas herramientas. |
@@ -256,7 +280,7 @@ Los errores criticos siguen usando `logger.exception()`.
 | `get_all_proveedores()` | Lista proveedores desde `proveedores_producto`. |
 | `get_product_suppliers()` | Lista proveedores de un producto. |
 | `set_primary_supplier()` | Cambia proveedor principal y actualiza cache en `productos`. |
-| `parse_and_classify_boleta()` | Lee CSV y clasifica filas. |
+| `parse_and_classify_boleta(..., default_proveedor)` | Lee CSV, aplica proveedor por defecto y clasifica filas. |
 | `apply_boleta_row()` | Aplica una fila de boleta. |
 | `apply_boleta_batch()` | Aplica lote de boleta. |
 | `get_range_summary()` | Resumen de ventas por rango. |
@@ -272,9 +296,9 @@ python -m unittest -v
 
 Estado actual:
 
-- 83 tests pasan.
+- 89 tests pasan.
 - Tests de GUI corren solo si hay display disponible.
-- Cobertura nueva incluye cascade de proveedores y restauracion de proveedores capturados en undo.
+- Cobertura nueva incluye cascade de proveedores, restore sin merge accidental, proveedores duplicados, promocion de secundario y proveedor por defecto en boleta.
 
 ## Pendientes / ideas
 

@@ -264,6 +264,31 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(suppliers[0]["proveedor"], "Prov")
         self.assertEqual(suppliers[0]["precio_costo"], 150.0)
 
+    def test_restore_product_does_not_merge_suppliers_when_code_was_reused(self):
+        stock_app.add_product(
+            self.conn, "REST03", "Original", 300, 2, 0,
+            proveedor="Prov viejo", precio_costo=150.0,
+        )
+        product = stock_app.get_product(self.conn, "REST03")
+        data = {k: product[k] for k in product.keys()}
+        data["suppliers"] = [
+            {k: supplier[k] for k in supplier.keys()}
+            for supplier in stock_app.get_product_suppliers(self.conn, "REST03")
+        ]
+        stock_app.delete_product(self.conn, "REST03")
+        stock_app.add_product(
+            self.conn, "REST03", "Nuevo", 400, 1, 0,
+            proveedor="Prov nuevo", precio_costo=200.0,
+        )
+
+        with self.assertRaises(stock_app.DuplicateProductError):
+            stock_app._restore_product(self.conn, data)
+
+        product = stock_app.get_product(self.conn, "REST03")
+        suppliers = stock_app.get_product_suppliers(self.conn, "REST03")
+        self.assertEqual(product["nombre"], "Nuevo")
+        self.assertEqual([row["proveedor"] for row in suppliers], ["Prov nuevo"])
+
     def test_update_product_empty_proveedor_removes_primary_supplier(self):
         stock_app.add_product(
             self.conn, "UP_EMPTY_PROV", "Sin proveedor", 100, 1, 0,
@@ -275,6 +300,24 @@ class StockAppTests(unittest.TestCase):
         )
         self.assertEqual(stock_app.get_product_suppliers(self.conn, "UP_EMPTY_PROV"), [])
         self.assertEqual(stock_app.get_all_proveedores(self.conn), [])
+
+    def test_update_product_empty_proveedor_promotes_remaining_supplier(self):
+        stock_app.add_product(
+            self.conn, "UP_PROMOTE", "Promover proveedor", 100, 1, 0,
+            proveedor="Prov B", precio_costo=20.0,
+        )
+        stock_app.add_product_supplier(self.conn, "UP_PROMOTE", "Prov A", 10.0)
+
+        stock_app.update_product(
+            self.conn, "UP_PROMOTE", "Promover proveedor", 100, 1, 0,
+            proveedor="", precio_costo=0.0,
+        )
+
+        product = stock_app.get_product(self.conn, "UP_PROMOTE")
+        suppliers = stock_app.get_product_suppliers(self.conn, "UP_PROMOTE")
+        self.assertEqual(product["proveedor"], "Prov A")
+        self.assertEqual(product["precio_costo"], 10.0)
+        self.assertEqual([(row["proveedor"], row["es_principal"]) for row in suppliers], [("Prov A", 1)])
 
     # ── bulk_price_increase ───────────────────────────────────────────────────
 
@@ -453,6 +496,16 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(rows[0]["proveedor"], "Proveedor A")
         self.assertEqual(rows[0]["es_principal"], 1)
 
+    def test_add_product_supplier_updates_existing_supplier_without_duplicate(self):
+        stock_app.add_product(self.conn, "MS04", "Producto", 100, 1, 0)
+        stock_app.add_product_supplier(self.conn, "MS04", "Proveedor A", 60)
+        stock_app.add_product_supplier(self.conn, "MS04", "Proveedor A", 75)
+        rows = stock_app.get_product_suppliers(self.conn, "MS04")
+        product = stock_app.get_product(self.conn, "MS04")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["precio_costo"], 75.0)
+        self.assertEqual(product["precio_costo"], 75.0)
+
     def test_set_primary_supplier_updates_producto(self):
         stock_app.add_product(self.conn, "MS02", "Producto", 100, 1, 0)
         stock_app.add_product_supplier(self.conn, "MS02", "Proveedor A", 60)
@@ -511,6 +564,61 @@ class StockAppTests(unittest.TestCase):
             self.assertEqual(rows_zero[0]["precio_costo"], 0.0)
         finally:
             conn.close()
+
+    def test_parse_boleta_uses_default_proveedor_when_csv_omits_it(self):
+        path = Path(self.tmp.name) / "boleta_default.csv"
+        path.write_text(
+            "codigo,nombre,cantidad,precio_costo\nBOL01,Producto,3,40\n",
+            encoding="utf-8",
+        )
+
+        result = stock_app.parse_and_classify_boleta(
+            self.conn,
+            path,
+            default_proveedor="Proveedor boleta",
+        )
+
+        self.assertEqual(len(result.rows_new), 1)
+        self.assertEqual(result.rows_new[0].proveedor, "Proveedor boleta")
+
+    def test_parse_boleta_csv_proveedor_overrides_default(self):
+        path = Path(self.tmp.name) / "boleta_override.csv"
+        path.write_text(
+            "codigo,nombre,cantidad,precio_costo,proveedor\n"
+            "BOL02,Producto,3,40,Proveedor fila\n",
+            encoding="utf-8",
+        )
+
+        result = stock_app.parse_and_classify_boleta(
+            self.conn,
+            path,
+            default_proveedor="Proveedor dialogo",
+        )
+
+        self.assertEqual(len(result.rows_new), 1)
+        self.assertEqual(result.rows_new[0].proveedor, "Proveedor fila")
+
+    def test_apply_boleta_row_reuses_existing_supplier_without_duplicate(self):
+        stock_app.add_product(
+            self.conn, "BOL03", "Producto", 100, 1, 0,
+            proveedor="Proveedor A", precio_costo=20.0,
+        )
+        row = stock_app.BoletaRow(
+            codigo="BOL03",
+            nombre="Producto",
+            cantidad=2,
+            precio_costo=25.0,
+            proveedor="Proveedor A",
+        )
+
+        stock_app.apply_boleta_row(self.conn, row)
+        stock_app.apply_boleta_row(self.conn, row)
+
+        product = stock_app.get_product(self.conn, "BOL03")
+        suppliers = stock_app.get_product_suppliers(self.conn, "BOL03")
+        self.assertEqual(product["stock"], 5)
+        self.assertEqual(len(suppliers), 1)
+        self.assertEqual(suppliers[0]["precio_costo"], 25.0)
 
 
 # =============================================================================
