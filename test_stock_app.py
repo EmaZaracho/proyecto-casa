@@ -237,6 +237,45 @@ class StockAppTests(unittest.TestCase):
         self.assertEqual(restored["precio_costo"], 150.0)
         self.assertEqual(restored["notas"], "Nota")
 
+    def test_delete_product_cascades_suppliers(self):
+        stock_app.add_product(
+            self.conn, "CAS01", "Cascade", 300, 2, 0,
+            proveedor="Prov", precio_costo=150.0,
+        )
+        self.assertEqual(len(stock_app.get_product_suppliers(self.conn, "CAS01")), 1)
+        stock_app.delete_product(self.conn, "CAS01")
+        self.assertEqual(stock_app.get_product_suppliers(self.conn, "CAS01"), [])
+
+    def test_restore_product_reinserts_suppliers_when_captured(self):
+        stock_app.add_product(
+            self.conn, "REST02", "Restore suppliers", 300, 2, 0,
+            proveedor="Prov", precio_costo=150.0,
+        )
+        product = stock_app.get_product(self.conn, "REST02")
+        data = {k: product[k] for k in product.keys()}
+        data["suppliers"] = [
+            {k: supplier[k] for k in supplier.keys()}
+            for supplier in stock_app.get_product_suppliers(self.conn, "REST02")
+        ]
+        stock_app.delete_product(self.conn, "REST02")
+        stock_app._restore_product(self.conn, data)
+        suppliers = stock_app.get_product_suppliers(self.conn, "REST02")
+        self.assertEqual(len(suppliers), 1)
+        self.assertEqual(suppliers[0]["proveedor"], "Prov")
+        self.assertEqual(suppliers[0]["precio_costo"], 150.0)
+
+    def test_update_product_empty_proveedor_removes_primary_supplier(self):
+        stock_app.add_product(
+            self.conn, "UP_EMPTY_PROV", "Sin proveedor", 100, 1, 0,
+            proveedor="Prov", precio_costo=10.0,
+        )
+        stock_app.update_product(
+            self.conn, "UP_EMPTY_PROV", "Sin proveedor", 100, 1, 0,
+            proveedor="", precio_costo=0.0,
+        )
+        self.assertEqual(stock_app.get_product_suppliers(self.conn, "UP_EMPTY_PROV"), [])
+        self.assertEqual(stock_app.get_all_proveedores(self.conn), [])
+
     # ── bulk_price_increase ───────────────────────────────────────────────────
 
     def test_bulk_price_increase_applies_percentage(self):
@@ -452,6 +491,13 @@ class StockAppTests(unittest.TestCase):
                 VALUES ('MIG01', 'Migrado', 100, 1, 0, 'Viejo', 70, '')
                 """
             )
+            conn.execute(
+                """
+                INSERT INTO productos
+                    (codigo, nombre, precio, stock, stock_minimo, proveedor, precio_costo, notas)
+                VALUES ('MIG02', 'Migrado cero', 100, 1, 0, 'Costo Cero', 0, '')
+                """
+            )
             conn.execute("DELETE FROM proveedores_producto")
             conn.commit()
             stock_app.initialize_database(conn)
@@ -459,6 +505,10 @@ class StockAppTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["proveedor"], "Viejo")
             self.assertEqual(rows[0]["es_principal"], 1)
+            rows_zero = stock_app.get_product_suppliers(conn, "MIG02")
+            self.assertEqual(len(rows_zero), 1)
+            self.assertEqual(rows_zero[0]["proveedor"], "Costo Cero")
+            self.assertEqual(rows_zero[0]["precio_costo"], 0.0)
         finally:
             conn.close()
 
@@ -634,6 +684,23 @@ class StockGuiTests(unittest.TestCase):
         rows = stock_app.list_products(self.test_conn)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["nombre"], "Undo Test")
+
+    def test_undo_redo_undo_product_deletion_preserves_suppliers(self):
+        stock_app.add_product(
+            self.test_conn, "UNDO_SUP", "Undo Supplier", 100, 1, 0,
+            proveedor="Prov A", precio_costo=10,
+        )
+        stock_app.add_product_supplier(self.test_conn, "UNDO_SUP", "Prov B", 9)
+        self.app.refresh_products()
+        iid = self.app.products_table.get_children()[0]
+        self.app.products_table.selection_set(iid)
+        with patch.object(stock_gui.messagebox, "askyesno", return_value=True):
+            self.app.delete_selected_product()
+        self.app._undo()
+        self.app._redo()
+        self.app._undo()
+        suppliers = stock_app.get_product_suppliers(self.test_conn, "UNDO_SUP")
+        self.assertEqual([row["proveedor"] for row in suppliers], ["Prov A", "Prov B"])
 
     def test_undo_sale(self):
         stock_app.add_product(self.test_conn, "SALE01", "Venta Undo", 1000, 5, 0)

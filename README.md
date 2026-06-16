@@ -1,14 +1,26 @@
 # Sistema de Stock
 
-Aplicación de escritorio en Python para gestión de inventario y punto de venta de un negocio pequeño. Corre localmente en Windows con Python + Tkinter + SQLite. Sin servidor, sin internet requerido.
+Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de un negocio pequeno. Corre localmente en Windows con Python, Tkinter y SQLite. No requiere servidor ni conexion a internet para operar.
 
-**Requisitos**
+## Estado actual
 
-- Python 3.10 o superior
-- Módulos estándar: `sqlite3`, `tkinter` (incluidos en Python)
-- Dependencia opcional: `fpdf2` — para exportar PDF (`pip install fpdf2`)
+- Rama de trabajo: `prueba-de-refactorizacion`.
+- Base de datos local SQLite con migraciones hasta schema v5.
+- GUI Tkinter con textos visibles en ASCII para evitar problemas de codificacion en Windows.
+- Proveedores normalizados en `proveedores_producto`; `productos.proveedor` y `productos.precio_costo` quedan como cache del proveedor principal.
+- SQLite abre con `PRAGMA foreign_keys=ON` y `PRAGMA journal_mode=WAL`.
+- Operaciones criticas de escritura usan transacciones con `with conn:`.
+- Undo/redo esta encapsulado en `UndoManager`.
+- Generacion de PDF esta encapsulada en `ReportGenerator`.
+- Suite actual: 83 tests con `unittest`.
 
-**Instalación**
+## Requisitos
+
+- Python 3.10 o superior.
+- Modulos estandar: `sqlite3`, `tkinter`, `unittest`.
+- Dependencia opcional: `fpdf2` para exportar PDF.
+
+Instalacion:
 
 ```powershell
 python -m venv .venv
@@ -16,51 +28,85 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-También podés ejecutar `setup.bat` con doble click para hacer todo en un paso.
+Tambien se puede ejecutar `setup.bat` con doble click para preparar el entorno.
 
-**Uso**
+## Uso
 
 ```powershell
 python stock_gui.py
 ```
 
-O con doble click en `iniciar_gui.bat` (Windows).
+O con doble click en `iniciar_gui.bat`.
 
-El programa crea automáticamente `stock.db`, `fotos_productos/` y `backups/` en la primera ejecución.
+En la primera ejecucion la app crea automaticamente:
 
-**Características principales**
+- `stock.db`
+- `backups/`
+- `config.json` cuando se guarda configuracion
+- `stock.log` cuando hay eventos o errores registrados
 
-- Alta, edición y eliminación de productos (clave: `codigo`).
-- Multi-proveedor por producto: cada producto puede tener N proveedores con su propio precio de costo; el proveedor principal determina el margen.
-- Importar productos y actualizar stock desde una **boleta CSV** (`codigo,nombre,cantidad,precio_costo,precio_venta,proveedor`). Los conflictos de precio se resuelven 1 a 1 con opciones: mantener, actualizar, o fijar porcentaje de ganancia.
-- Registro de ventas y actualización de stock. Modo carrito para cobrar múltiples productos juntos.
-- Control de ventas por forma de pago (Efectivo, Débito, Crédito, Transferencia).
-- Registro de caja diaria con desglose por forma de pago y ganancia bruta.
-- Aumentos masivos de precio por porcentaje con vista previa.
-- Historial de cambios de precio con motivo (Edición manual / Aumento masivo / Importación boleta).
-- Filtro de ventas por fecha o rango de fechas (formato DD-MM-AAAA).
-- **Deshacer (Ctrl+Z) y Rehacer (Ctrl+Y)** — hasta 10 pasos.
-- Exportar productos y ventas a CSV; exportar reportes a PDF.
-- Pendientes (to-do) internos con estados Pendiente / Completado.
-- Modo oscuro. Backup automático diario.
+## Funcionalidades principales
 
-**Ejecutar pruebas**
+- Alta, edicion y eliminacion de productos por `codigo`.
+- Multi-proveedor por producto, con proveedor principal y precio de costo propio.
+- Busqueda de productos por codigo, nombre y proveedor.
+- Alertas de stock bajo y sin stock.
+- Registro de ventas individuales y ventas por carrito.
+- Formas de pago: `Efectivo`, `Transferencia`, `Tarjeta`.
+- Caja diaria con total, desglose por forma de pago y ganancia bruta.
+- Historial de cambios de precio con motivo.
+- Aumento masivo de precios con vista previa y undo.
+- Importacion de boletas CSV con formato:
+
+```csv
+codigo,nombre,cantidad,precio_costo,precio_venta,proveedor
+```
+
+- Resolucion manual de conflictos de precio al importar boletas.
+- Pendientes internos con estado Pendiente / Completado.
+- Filtro de ventas por fecha o rango de fechas en formato `DD-MM-AAAA`.
+- Exportacion de productos y ventas a CSV.
+- Reportes PDF por secciones: productos, ventas, pendientes y stock bajo.
+- Modo oscuro.
+- Backup automatico diario del archivo de base de datos.
+- Deshacer y rehacer con `Ctrl+Z` / `Ctrl+Y`, hasta 10 pasos.
+
+## Pruebas
 
 ```powershell
 python -m unittest -v
 ```
 
-79 tests. Las pruebas de GUI se omiten automáticamente si no hay display disponible.
+Estado actual: 83 tests pasan.
 
-**Empaquetar como .exe**
+Nota: `pytest` no es requisito del proyecto. Si se quiere usar el comando del plan:
 
 ```powershell
-setup.bat       # instala dependencias incluido PyInstaller
-build.bat       # genera dist\SistemaDeStock.exe
+python -m pytest test_stock_app.py -v
 ```
 
-**Notas**
+hay que instalar `pytest` aparte.
 
-- Exportación a PDF requiere `fpdf2`; la app sugiere instalarlo si falta.
-- El formato de fecha en toda la interfaz es DD-MM-AAAA.
-- `stock.db` y `config.json` están en `.gitignore`.
+## Empaquetar como .exe
+
+```powershell
+setup.bat
+build.bat
+```
+
+El ejecutable se genera en `dist\SistemaDeStock.exe`.
+
+## Archivos principales
+
+- `stock_app.py`: capa de datos, migraciones, logica de negocio y funciones puras.
+- `stock_gui.py`: interfaz Tkinter, orquestacion de flujos, undo/redo y reportes.
+- `test_stock_app.py`: tests unitarios y tests GUI cuando hay display disponible.
+- `requirements.txt`: dependencias Python.
+- `stock.spec`: configuracion de PyInstaller.
+- `setup.bat`, `build.bat`, `iniciar_gui.bat`: scripts de Windows.
+
+## Notas
+
+- `stock.db`, `config.json`, `stock.log` y `backups/` son artefactos runtime y no deberian versionarse.
+- La app usa fechas ISO en SQLite y `DD-MM-AAAA` en la interfaz.
+- Al borrar un producto, SQLite elimina sus proveedores por cascade; el undo captura esos proveedores para poder restaurarlos.

@@ -1,202 +1,329 @@
-PLAN DE MEJORAS — Sistema de Stock
-====================================
-Fecha: 2026-06-15
+PLAN DE MEJORAS TÉCNICAS — Sistema de Stock
+============================================
+Fecha: 2026-06-16
+Rama de trabajo: prueba-de-refactorizacion
 
 CONTEXTO
 --------
-Las tres funcionalidades de UX priorizadas a implementar:
-  Feat 2 — Foco automático en campo de código al volver a Principal (soporte lector de barras)
-  Feat 3 — Pestaña Resumen / Dashboard con ventas del día y alertas de stock
-  Feat 7 — Notificaciones no bloqueantes (toast via status bar) en lugar de showinfo modales
+Análisis del codebase con knowledge graph identificó 8 categorías de mejoras:
+  - Bugs de integridad de datos (transacciones no atómicas, FKs inactivas)
+  - Datos incorrectos en UI (get_all_proveedores usa tabla obsoleta)
+  - Calidad de código (logging mínimo, excepciones silenciosas)
+  - Mantenibilidad (StockGui god-class de 2783 líneas)
 
-Estado: IMPLEMENTADAS (todas en stock_gui.py, 2026-06-15)
-
-
-======================================================================
-FEAT 2 — FOCO AUTOMÁTICO EN CÓDIGO DE VENTA
-======================================================================
-
-Problema
---------
-Al volver a la pestaña Principal (después de consultar ventas, precios,
-etc.), el foco de teclado queda en ningún lado. Con un lector de barras
-USB (que actúa como teclado) hay que hacer click manualmente antes de
-escanear.
-
-Cambio implementado
--------------------
-En _on_tab_changed() — cuando el índice activo es 1 (Principal):
-
-  elif idx == 1:
-      self.after(50, self._venta_codigo_entry.focus_set)
-
-El after(50) da tiempo al Notebook de terminar la animación de cambio
-de pestaña antes de aplicar el foco.
-
-Archivos modificados
---------------------
-  stock_gui.py — método _on_tab_changed (índices actualizados tras
-                 agregar Dashboard en posición 0)
-
-Verificación
-------------
-1. Abrir app → pestaña Resumen visible (Dashboard en índice 0)
-2. Navegar a Ventas del día → volver a Principal
-3. Escribir un código o conectar lector de barras → código se captura
-   sin necesidad de click previo
+Todos los cambios se implementan en la rama "prueba-de-refactorizacion"
+para probar antes de mergear a main.
 
 
 ======================================================================
-FEAT 3 — PESTAÑA RESUMEN (DASHBOARD)
+FASE 0 — CREAR RAMA DE TRABAJO
 ======================================================================
 
-Problema
---------
-Para conocer el estado del negocio hay que navegar por múltiples
-pestañas. No existe una vista consolidada al abrir la app.
+  git checkout -b prueba-de-refactorizacion
 
-Diseño implementado
--------------------
-Nueva pestaña "Resumen" en posición 0 (primera al abrir la app).
-Tres secciones:
 
-  A. Ventas de hoy
-     - Total vendido (texto grande estilo Title.TLabel)
-     - Cantidad de ventas
-     - Desglose por forma de pago (Efectivo / Débito / etc.)
-     Usa: get_daily_summary(conn) + get_payment_breakdown(conn)
+======================================================================
+FASE 1 — CORRECCIONES CRÍTICAS EN stock_app.py
+======================================================================
 
-  B. Alertas de stock
-     - Label con conteo: "🔴 N sin stock  |  🟡 N bajo mínimo"
-     - Treeview con hasta 10 productos (críticos primero, luego bajos)
-       Columnas: Código | Nombre | Stock
-     Usa: search_products(conn) filtrando stock <= stock_minimo
+1.1  get_connection — Activar pragmas SQLite
+--------------------------------------------
+Archivo: stock_app.py línea 73
 
-  C. Acceso rápido
-     - Botón "🧾 Nueva venta (F1)" → selecciona tab Principal + foco en código
-     - Botón "🔍 Buscar producto" → selecciona tab Principal + foco en búsqueda
-     - Botón "📦 Nuevo producto (F2)" → selecciona tab Principal + abre formulario
+  ANTES:
+    def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-Métodos agregados
------------------
-  _build_tab_dashboard(frame) — construye los widgets del Dashboard
-  _refresh_dashboard()        — actualiza todos los datos del Dashboard
+  DESPUÉS:
+    def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
-Variables de instancia nuevas
+Por qué:
+  - foreign_keys=ON activa el ON DELETE CASCADE en proveedores_producto.
+    Sin este pragma, borrar un producto NO elimina sus proveedores (FK ignorada).
+  - journal_mode=WAL mejora performance en lecturas concurrentes.
+
+
+1.2  Convertir conn.commit() sueltos a "with conn:"
+----------------------------------------------------
+Problema: múltiples funciones tienen conn.commit() suelto fuera de un
+bloque with. Si cualquier operación intermedia falla, los datos quedan
+en estado inconsistente sin rollback automático.
+
+Funciones a corregir:
+
+  | Función              | Línea aprox. | Operaciones en riesgo                         |
+  |----------------------|--------------|-----------------------------------------------|
+  | update_product       | 301-341      | UPDATE productos + UPDATE proveedores_producto |
+  | _restore_product     | 344-358      | INSERT OR IGNORE productos                    |
+  | delete_product       | 361-367      | DELETE productos                               |
+  | adjust_stock         | 409-424      | UPDATE productos SET stock                     |
+  | bulk_price_increase  | 600-615      | Múltiples UPDATE + INSERT historial            |
+  | add_pending          | ~704         | INSERT pendientes                              |
+  | complete_pending     | ~717         | UPDATE pendientes                              |
+  | delete_pending       | ~723         | DELETE pendientes                              |
+
+Patrón de cambio para cada función:
+
+  ANTES:
+    try:
+        conn.execute("UPDATE ...")
+        # más operaciones...
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        raise StockError(...) from exc
+
+  DESPUÉS:
+    try:
+        with conn:
+            conn.execute("UPDATE ...")
+            # más operaciones...
+    except sqlite3.IntegrityError as exc:
+        raise StockError(...) from exc
+
+Nota sobre update_product: también llama a log_price_change() que no
+hace commit propio. Al envolver todo en "with conn:", el log de precio
+queda en la misma transacción — correcto.
+
+
+1.3  get_all_proveedores — Corregir tabla consultada
+----------------------------------------------------
+Archivo: stock_app.py línea 434
+
+Desde la migración v5 los proveedores viven en proveedores_producto.
+La función actual solo lee productos.proveedor (columna cache del
+proveedor principal), ignorando proveedores secundarios.
+
+  ANTES:
+    def get_all_proveedores(conn: sqlite3.Connection) -> list[str]:
+        rows = conn.execute(
+            "SELECT DISTINCT proveedor FROM productos "
+            "WHERE proveedor != '' ORDER BY proveedor"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+  DESPUÉS:
+    def get_all_proveedores(conn: sqlite3.Connection) -> list[str]:
+        rows = conn.execute(
+            "SELECT DISTINCT proveedor FROM proveedores_producto "
+            "ORDER BY proveedor"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+
+1.4  load_config — Loguear en lugar de silenciar la excepción
+-------------------------------------------------------------
+Archivo: stock_app.py línea 26
+
+  ANTES:
+    except Exception:
+        pass
+
+  DESPUÉS:
+    except Exception:
+        logger.warning("No se pudo leer config.json, usando valores por defecto")
+
+
+======================================================================
+FASE 2 — MEJORAS DE LOGGING EN stock_gui.py
+======================================================================
+
+2.1  Cambiar nivel de logging de ERROR a INFO
+---------------------------------------------
+Archivo: stock_gui.py línea 32
+
+  ANTES:  level=logging.ERROR,
+  DESPUÉS: level=logging.INFO,
+
+
+2.2  Agregar logger.info() en operaciones de negocio
+----------------------------------------------------
+Agregar en las siguientes operaciones (ya tienen try/except):
+
+  Venta individual completada (~línea 2497):
+    logger.info("Venta: %s x%d $%.2f", codigo, cantidad, total)
+
+  Carrito procesado (~línea 1456):
+    logger.info("Carrito procesado: %d items, total $%.2f", n, total)
+
+  Producto eliminado (~línea 2447):
+    logger.info("Producto eliminado: %s", codigo)
+
+  Aumento de precios bulk (~línea 1537):
+    logger.info("Aumento masivo %.1f%% a %d productos", pct, n)
+
+  Import boleta CSV completado (~línea 2735):
+    logger.info("Boleta importada: %d nuevos, %d actualizados", new, updated)
+
+
+======================================================================
+FASE 3 — REFACTOR ESTRUCTURAL DE stock_gui.py
+======================================================================
+
+3.1  Extraer clase UndoManager
 ------------------------------
-  self._dash_total_var    — StringVar para total del día
-  self._dash_count_var    — StringVar para cantidad de ventas
-  self._dash_pagos_var    — StringVar para desglose por pago
-  self._dash_alert_var    — StringVar para label de alertas
-  self._dash_stock_list   — Treeview de productos con stock bajo
-  self._product_search_entry — Entry de búsqueda de productos (antes
-                               era local; ahora guardado como atributo
-                               para poder focusearlo desde Dashboard)
+Crear antes de StockGui en stock_gui.py:
 
-Archivos modificados
---------------------
-  stock_gui.py
-    _build_layout        — agrega tab0 antes de tab1, llama _build_tab_dashboard
-    _build_tab_principal — guarda search entry como self._product_search_entry
-    _on_tab_changed      — índices actualizados (+1 en todos); idx=0 llama _refresh_dashboard
-    refresh_all          — llama _refresh_dashboard() + índices actualizados
-    _build_tab_dashboard — nuevo
-    _refresh_dashboard   — nuevo
+  class UndoManager:
+      def __init__(self, max_size: int = _UNDO_MAX) -> None:
+          self._undo: list[dict[str, Any]] = []
+          self._redo: list[dict[str, Any]] = []
+          self._max = max_size
 
-Consideración de índices
-------------------------
-Al agregar Dashboard en posición 0, todos los índices suben en 1:
-  0: Resumen (Dashboard)    — antes no existía
-  1: Principal              — antes era 0
-  2: Gestión de precios     — antes era 1
-  3: Ventas del día         — antes era 2
-  4: Historial de precios   — antes era 3
-  5: Reportes               — antes era 4
+      def push(self, action: dict[str, Any]) -> None:
+          self._undo.append(action)
+          if len(self._undo) > self._max:
+              self._undo.pop(0)
+          self._redo.clear()
 
-Verificación
-------------
-1. Abrir app → pestaña Resumen es la primera (automático)
-2. Registrar una venta → volver a Resumen → total y count actualizados
-3. Reducir stock de un producto a 0 → aparece en lista de alertas
-4. Botón "Nueva venta" → lleva a Principal con foco en código
-5. Botón "Buscar producto" → lleva a Principal con foco en búsqueda
+      def pop_undo(self) -> dict[str, Any] | None:
+          return self._undo.pop() if self._undo else None
+
+      def push_redo(self, action: dict[str, Any]) -> None:
+          self._redo.append(action)
+          if len(self._redo) > self._max:
+              self._redo.pop(0)
+
+      def pop_redo(self) -> dict[str, Any] | None:
+          return self._redo.pop() if self._redo else None
+
+      @property
+      def can_undo(self) -> bool:
+          return bool(self._undo)
+
+      @property
+      def can_redo(self) -> bool:
+          return bool(self._redo)
+
+En StockGui.__init__ reemplazar:
+  self._undo_stack: list[dict[str, Any]] = []
+  self._redo_stack: list[dict[str, Any]] = []
+por:
+  self._undo_mgr = UndoManager()
+
+Luego actualizar todos los usos en el archivo:
+  self._push_undo(action)          → self._undo_mgr.push(action)
+  self._undo_stack.pop()           → self._undo_mgr.pop_undo()
+  self._redo_stack.append(entry)   → self._undo_mgr.push_redo(entry)
+  self._redo_stack.pop()           → self._undo_mgr.pop_redo()
+  bool(self._undo_stack)           → self._undo_mgr.can_undo
+  bool(self._redo_stack)           → self._undo_mgr.can_redo
+
+Eliminar el método _push_undo de StockGui (migra a UndoManager).
+
+
+3.2  Extraer clase ReportGenerator
+-----------------------------------
+Crear antes de StockGui en stock_gui.py:
+
+  class ReportGenerator:
+      """Genera PDFs de reporte a partir de datos del negocio."""
+
+      def __init__(self, conn: sqlite3.Connection, config: dict) -> None:
+          self._conn = conn
+          self._config = config
+
+      def generate(self, filepath: str, options: dict) -> None:
+          """Punto de entrada principal. options tiene flags y rango de fechas."""
+
+      def _draw_header(self, pdf, title: str) -> None: ...
+      def _draw_table(self, pdf, headers, rows, col_widths) -> None: ...
+      def _section_productos(self, pdf) -> None: ...
+      def _section_ventas(self, pdf, desde: date, hasta: date) -> None: ...
+      def _section_pendientes(self, pdf) -> None: ...
+      def _section_stock_bajo(self, pdf) -> None: ...
+
+Migrar la lógica de StockGui._generar_reporte_pdf (174 líneas, línea 1784)
+a los métodos anteriores.
+
+En StockGui, el método queda como thin wrapper:
+  def _generar_reporte_pdf(self) -> None:
+      # recoger opciones de los BooleanVar y StringVar existentes
+      # construir options dict
+      # llamar self._report_gen.generate(filepath, options)
+      # actualizar status bar
+
+ReportGenerator se instancia en StockGui.__init__:
+  self._report_gen = ReportGenerator(self.conn, self._config)
+
+
+3.3  Agrupar inicialización de StringVar en métodos privados
+------------------------------------------------------------
+Descomponer los 19+ tk.StringVar del __init__ en 5 métodos privados.
+Llamarlos en __init__ en lugar de declarar las vars inline.
+
+  Métodos a crear:
+    _init_product_vars()   → codigo_var, nombre_var, precio_var, precio_costo_var,
+                             stock_var, stock_minimo_var, proveedor_var, notas_var
+                             (líneas 54-61)
+
+    _init_sale_vars()      → venta_codigo_var, venta_cantidad_var,
+                             _venta_forma_pago_var, _producto_preview_var,
+                             _ventas_summary_var, _cart_total_var
+                             (líneas 64-75)
+
+    _init_price_vars()     → price_search_var, price_proveedor_var,
+                             aumento_var, _price_status_var
+                             (líneas 78-81)
+
+    _init_historial_vars() → _hist_search_var
+                             (línea 84)
+
+    _init_ventas_vars()    → _ventas_date_var, _ventas_total_var,
+                             _ventas_desde_var, _ventas_hasta_var,
+                             _ventas_range_active,
+                             _rep_productos_var, _rep_ventas_var,
+                             _rep_pendientes_var, _rep_stock_bajo_var,
+                             _rep_desde_var, _rep_hasta_var
+                             (líneas 87-99)
+
+  En __init__ reemplazar el bloque de 45 líneas por:
+    self._init_product_vars()
+    self._init_sale_vars()
+    self._init_price_vars()
+    self._init_historial_vars()
+    self._init_ventas_vars()
 
 
 ======================================================================
-FEAT 7 — TOAST NOTIFICATIONS (STATUS BAR)
+ORDEN DE IMPLEMENTACIÓN
 ======================================================================
 
-Problema
---------
-Los messagebox.showinfo de éxito son modales: bloquean la app y
-requieren un click para cerrarlos. Para flujos rápidos (importar
-boleta, cobrar carrito) interrumpen el ritmo de trabajo.
-
-Solución implementada
----------------------
-Ya existía _set_status(msg, ms=3000) que muestra texto en la status
-bar por 3 segundos y se borra solo. Estaba infrautilizado.
-
-Criterio aplicado:
-  showinfo de ÉXITO sin detalles → _set_status("✓ mensaje")
-  showinfo con errores / filas ignoradas → messagebox.showinfo (el
-    usuario necesita revisar los detalles)
-  showerror y askyesno → siempre modal (errores y confirmaciones
-    requieren atención explícita)
-
-Cambios en importación de boleta (_import_boleta_csv)
-------------------------------------------------------
-  - "Sin datos: CSV sin filas válidas" → _set_status
-  - Importación completada sin errores ni filas ignoradas → _set_status
-  - Importación completada CON errores o filas ignoradas → showinfo
-    (el detalle importa)
-
-  Lógica auxiliar agregada: _build_summary(with_conflicts) devuelve
-  (resumen_corto, tiene_detalles_largos) para decidir qué usar.
-
-Cobro de carrito (_cobrar_carrito)
-----------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
-
-Aumento de precios (_apply_price_increase)
-------------------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
-
-Ajuste de stock (_show_adjust_stock_dialog)
--------------------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
-
-Archivos modificados
---------------------
-  stock_gui.py — _import_boleta_csv (3 bloques cambiados)
-
-Verificación
-------------
-1. Importar CSV con productos nuevos sin conflictos → toast en status bar,
-   no aparece popup modal
-2. Importar CSV con filas ignoradas → showinfo modal con detalle
-3. Importar CSV con errores → showinfo modal con detalle
-4. Cobrar carrito → toast en status bar (ya funcionaba)
-5. showerror por código inválido → sigue siendo modal
+  1. git checkout -b prueba-de-refactorizacion
+  2. Fase 1 completa (stock_app.py) — correcciones atómicas sin riesgo de UI
+  3. Fase 2 (logging en stock_gui.py) — cambios mínimos
+  4. Fase 3.3 (agrupar StringVar) — refactor interno sin cambio de comportamiento
+  5. Fase 3.1 (UndoManager) — extraer clase, adaptar referencias
+  6. Fase 3.2 (ReportGenerator) — extraer clase, adaptar referencias
 
 
 ======================================================================
-PENDIENTES / IDEAS FUTURAS
+VERIFICACIÓN
 ======================================================================
 
-Feat 1 — Ticket post-venta
---------------------------
-Popup con detalle itemizado después de cobrar (artículos, subtotales,
-total, forma de pago, fecha). Opción para imprimir o copiar como texto.
-Requiere: ningún cambio de schema. Solo UI en _cobrar_carrito.
+  python -m pytest test_stock_app.py -v
+    → Todos los tests deben pasar sin cambios
 
-Feat 5 — Notas por venta
--------------------------
-Campo de texto libre al cobrar, visible en historial de ventas.
-Requiere: schema v6 (columna 'notas' en tabla ventas).
+  python stock_gui.py
+    → App abre correctamente
 
-Feat 8 — Comparación de períodos en reportes PDF
--------------------------------------------------
-En la sección de ventas del reporte, agregar columna comparativa con
-el período anterior equivalente.
-Requiere: segunda llamada a get_ventas_rango con fechas desplazadas.
+  Flujos a probar manualmente:
+    - Agregar producto → editar → eliminar → deshacer → rehacer
+    - Registrar venta individual y con carrito
+    - Aumento masivo de precios → deshacer
+    - Generación de PDF con todas las secciones activas
+    - Import de boleta CSV (CSV válido y CSV con errores)
+    - Cierre de caja
+
+  Verificar en stock.log:
+    → Aparecen entradas INFO para ventas, eliminaciones, etc.
+
+  Verificar en SQLite Browser (o con pragma):
+    → Al borrar un producto se eliminan sus proveedores_producto (CASCADE activo)
+    → journal_mode devuelve 'wal'
