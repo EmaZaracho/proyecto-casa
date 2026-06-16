@@ -18,7 +18,7 @@ App de escritorio para gestion de inventario y punto de venta de un negocio pequ
 
 ## Estado actual
 
-- Rama de trabajo: `prueba-de-refactorizacion`.
+- Rama principal: `main`. Refactorizacion tecnica completa mergeada desde `prueba-de-refactorizacion`.
 - Schema actual: v5.
 - Tests actuales: 89 con `python -m unittest -v`.
 - `pytest` no esta instalado por defecto.

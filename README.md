@@ -4,7 +4,7 @@ Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de 
 
 ## Estado actual
 
-- Rama de trabajo: `prueba-de-refactorizacion`.
+- Rama principal: `main`. Refactorizacion tecnica completa mergeada.
 - Base de datos local SQLite con migraciones hasta schema v5.
 - GUI Tkinter con textos visibles en ASCII para evitar problemas de codificacion en Windows.
 - Proveedores normalizados en `proveedores_producto`; `productos.proveedor` y `productos.precio_costo` quedan como cache del proveedor principal.
