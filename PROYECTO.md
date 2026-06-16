@@ -25,7 +25,9 @@ App de escritorio para gestion de inventario y punto de venta de un negocio pequ
 - Textos visibles de la GUI normalizados a ASCII para evitar mojibake en Windows.
 - Refactor tecnico aplicado:
   - `UndoManager` encapsula pilas de undo/redo.
+  - `StockService` encapsula operaciones de negocio sobre `self.conn`.
   - `ReportGenerator` encapsula generacion de PDF.
+  - Refresh selectivo reemplaza `refresh_all()` en flujos de escritura.
   - Variables Tkinter inicializadas en metodos privados.
   - Logging subido a nivel `INFO`.
   - Escrituras criticas en `stock_app.py` protegidas con `with conn:`.
@@ -53,7 +55,9 @@ backups/          - backups automaticos diarios, no versionados
 
 `stock_app.py` concentra la capa de datos y negocio. No importa Tkinter. Expone funciones para productos, ventas, caja, proveedores, pendientes, historial, CSV, PDF data y backups.
 
-`stock_gui.py` construye la interfaz Tkinter y llama a `stock_app.py`. No deberia hacer SQL directo salvo casos puntuales que convenga migrar despues.
+`StockService` vive en `stock_app.py` y actua como fachada fina sobre esas funciones. Encapsula la conexion SQLite y evita que la GUI pase `self.conn` en cada operacion de escritura.
+
+`stock_gui.py` construye la interfaz Tkinter y usa `self._svc` para operaciones de negocio frecuentes. No deberia hacer SQL directo salvo casos puntuales que convenga migrar despues.
 
 ### Clases estructurales nuevas
 
@@ -72,8 +76,23 @@ backups/          - backups automaticos diarios, no versionados
 - seccion ventas
 - seccion pendientes
 - seccion stock bajo
+- lectura fresca de `config.json` en cada `generate()`
 
 La GUI queda como wrapper: recoge opciones, pide archivo destino y delega en `ReportGenerator.generate()`.
+
+### Refresh selectivo
+
+`refresh_all()` queda para startup y el boton "Actualizar lista". Las operaciones de escritura usan helpers especificos:
+
+- `_refresh_after_sale()`
+- `_refresh_after_product_change()`
+- `_refresh_after_price_change()`
+- `_refresh_after_stock_change()`
+- `_refresh_after_supplier_change()`
+- `_refresh_after_pending_change()`
+- `_refresh_after_import()`
+
+Las pestañas caras (`Precios`, `Ventas`) solo se refrescan si estan visibles.
 
 ## Base de datos
 
@@ -253,8 +272,10 @@ Los errores criticos siguen usando `logger.exception()`.
 | Undo de eliminacion captura proveedores | Necesario porque cascade borra `proveedores_producto`. |
 | Restore no usa `INSERT OR IGNORE` | Evita mezclar proveedores si un codigo eliminado fue reutilizado antes del undo. |
 | Proveedor de boleta por dialogo | Permite omitir `proveedor` en el CSV sin perder trazabilidad. |
+| `StockService` como fachada de negocio | Reduce acoplamiento entre GUI y funciones de `stock_app.py`. |
+| Refresh selectivo | Evita queries y reconstrucciones de Treeview no afectadas por la accion. |
 | `UndoManager` | Reduce responsabilidad directa de `StockGui`. |
-| `ReportGenerator` | Aisla generacion PDF de la GUI. |
+| `ReportGenerator` lee config al generar | Evita quedar atado a una referencia vieja del dict de config. |
 | Textos visibles ASCII | Evita mojibake en Tkinter/Windows con archivos tocados por distintas herramientas. |
 | `log_price_change()` sin commit propio | Auditoria y cambio quedan en la misma transaccion. |
 | Margen sobre precio de venta | Convencion actual del negocio. |
@@ -267,6 +288,7 @@ Los errores criticos siguen usando `logger.exception()`.
 |---|---|
 | `get_connection()` | Abre SQLite, row factory, WAL y foreign keys. |
 | `initialize_database()` | Crea tablas y aplica migraciones. |
+| `StockService` | Fachada para operaciones de negocio con una conexion SQLite. |
 | `add_product()` | Alta de producto y proveedor principal. |
 | `update_product(..., motivo)` | Edita producto, proveedor principal e historial de precio. |
 | `delete_product()` | Elimina producto; proveedores caen por cascade. |

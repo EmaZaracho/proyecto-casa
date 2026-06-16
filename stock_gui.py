@@ -6,7 +6,7 @@ import tkinter as tk
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any
+from typing import Any, Callable
 
 import stock_app
 
@@ -88,26 +88,27 @@ class UndoManager:
 class ReportGenerator:
     """Genera PDFs de reporte a partir de datos del negocio."""
 
-    def __init__(self, conn: sqlite3.Connection, config: dict) -> None:
+    def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
-        self._config = config
 
-    @property
-    def _moneda(self) -> str:
-        return self._config.get("moneda", "$")
+    @staticmethod
+    def _moneda(config: dict) -> str:
+        return config.get("moneda", "$")
 
     def generate(self, filepath: str, options: dict) -> None:
-        from fpdf import FPDF  # type: ignore
+        from fpdf import FPDF  # type: ignore[import-untyped]
 
+        config = stock_app.load_config()
+        moneda = self._moneda(config)
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
-        self._draw_header(pdf, self._config.get("nombre_negocio", "Reporte"))
+        self._draw_header(pdf, config.get("nombre_negocio", "Reporte"))
 
         if options.get("productos"):
-            self._section_productos(pdf)
+            self._section_productos(pdf, moneda)
         if options.get("ventas"):
-            self._section_ventas(pdf, options["desde"], options["hasta"])
+            self._section_ventas(pdf, options["desde"], options["hasta"], moneda)
         if options.get("pendientes"):
             self._section_pendientes(pdf)
         if options.get("stock_bajo"):
@@ -139,7 +140,7 @@ class ReportGenerator:
                 pdf.cell(width, 6, str(text), border=1, align=align)
             pdf.ln()
 
-    def _section_productos(self, pdf) -> None:
+    def _section_productos(self, pdf, moneda: str) -> None:
         productos = stock_app.list_products(self._conn)
         self._section_title(pdf, f"Productos ({len(productos)})")
         rows = []
@@ -149,8 +150,8 @@ class ReportGenerator:
             rows.append([
                 (p["codigo"], 25, ""),
                 (str(p["nombre"])[:38], 65, ""),
-                (f"{self._moneda}{precio:.2f}", 25, "R"),
-                (f"{self._moneda}{costo:.2f}" if costo > 0 else "-", 25, "R"),
+                (f"{moneda}{precio:.2f}", 25, "R"),
+                (f"{moneda}{costo:.2f}" if costo > 0 else "-", 25, "R"),
                 (p["stock"], 18, "C"),
                 (p["stock_minimo"], 18, "C"),
                 (str(p["proveedor"] or "-")[:8], 14, ""),
@@ -163,7 +164,7 @@ class ReportGenerator:
         )
         pdf.ln(6)
 
-    def _section_ventas(self, pdf, desde: date, hasta: date) -> None:
+    def _section_ventas(self, pdf, desde: date, hasta: date, moneda: str) -> None:
         desde_iso = desde.isoformat()
         hasta_iso = hasta.isoformat()
         ventas = stock_app.get_ventas_rango(self._conn, desde_iso, hasta_iso)
@@ -176,10 +177,10 @@ class ReportGenerator:
         self._section_title(pdf, titulo)
 
         pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(60, 6, f"Total: {self._moneda}{resumen['total']:.2f}", border=0)
+        pdf.cell(60, 6, f"Total: {moneda}{resumen['total']:.2f}", border=0)
         pdf.cell(60, 6, f"Transacciones: {resumen['count']}", border=0)
         ganancia = resumen.get("ganancia_bruta", 0)
-        pdf.cell(0, 6, f"Ganancia bruta: {self._moneda}{ganancia:.2f}", ln=True, border=0)
+        pdf.cell(0, 6, f"Ganancia bruta: {moneda}{ganancia:.2f}", ln=True, border=0)
 
         if resumen["breakdown"]:
             pdf.set_font("Helvetica", "", 8)
@@ -188,7 +189,7 @@ class ReportGenerator:
                     0,
                     5,
                     f"  {row['forma_pago']}: {row['cantidad']} ventas - "
-                    f"{self._moneda}{float(row['total']):.2f}",
+                    f"{moneda}{float(row['total']):.2f}",
                     ln=True,
                 )
         pdf.ln(3)
@@ -200,8 +201,8 @@ class ReportGenerator:
                 (str(v["hora"])[:5], 18, "C"),
                 (str(v["nombre"])[:42], 70, ""),
                 (v["cantidad"], 14, "C"),
-                (f"{self._moneda}{float(v['precio_unit']):.2f}", 24, "R"),
-                (f"{self._moneda}{float(v['total']):.2f}", 24, "R"),
+                (f"{moneda}{float(v['precio_unit']):.2f}", 24, "R"),
+                (f"{moneda}{float(v['total']):.2f}", 24, "R"),
                 (str(v["forma_pago"])[:10], 18, ""),
             ])
         self._draw_table(
@@ -221,7 +222,7 @@ class ReportGenerator:
                     0,
                     5,
                     f"  {i}. {row['nombre']} - {row['total_cant']} unid. - "
-                    f"{self._moneda}{float(row['total_monto']):.2f}",
+                    f"{moneda}{float(row['total_monto']):.2f}",
                     ln=True,
                 )
         pdf.ln(6)
@@ -274,10 +275,11 @@ class StockGui(tk.Tk):
 
         self.conn = stock_app.get_connection()
         stock_app.initialize_database(self.conn)
+        self._svc = stock_app.StockService(self.conn)
         self._config = stock_app.load_config()
         self._dark_mode: bool = bool(self._config.get("dark_mode", False))
         self._muted_labels: list[ttk.Label] = []
-        self._report_gen = ReportGenerator(self.conn, self._config)
+        self._report_gen = ReportGenerator(self.conn)
         self._init_product_vars()
         self._init_sale_vars()
         self._init_price_vars()
@@ -311,7 +313,7 @@ class StockGui(tk.Tk):
 
         # silent daily backup
         try:
-            stock_app.backup_database()
+            self._svc.backup()
         except Exception:
             pass
 
@@ -512,8 +514,8 @@ class StockGui(tk.Tk):
         ).pack(side="left")
 
     def _refresh_dashboard(self) -> None:
-        summary = stock_app.get_daily_summary(self.conn)
-        breakdown = stock_app.get_payment_breakdown(self.conn)
+        summary = self._svc.resumen_diario()
+        breakdown = self._svc.desglose_pagos()
 
         self._dash_total_var.set(f"${summary['total']:.2f}")
         count = summary["count"]
@@ -526,7 +528,7 @@ class StockGui(tk.Tk):
         else:
             self._dash_pagos_var.set("Sin ventas registradas")
 
-        productos = stock_app.search_products(self.conn)
+        productos = self._svc.buscar_productos()
         criticos = [p for p in productos if p["stock"] <= 0]
         bajos = [p for p in productos if 0 < p["stock"] < p["stock_minimo"]]
 
@@ -1016,7 +1018,7 @@ class StockGui(tk.Tk):
     def _refresh_price_history(self) -> None:
         clear_table(self._hist_table)
         query = self._hist_search_var.get()
-        for row in stock_app.search_price_history(self.conn, query):
+        for row in self._svc.historial_precios(query):
             ant = float(row["precio_anterior"])
             nvo = float(row["precio_nuevo"])
             if ant > 0:
@@ -1207,7 +1209,7 @@ class StockGui(tk.Tk):
             self._producto_preview_var.set("")
             return
         try:
-            row = stock_app.get_product(self.conn, codigo)
+            row = self._svc.obtener_producto(codigo)
             if row:
                 self._producto_preview_var.set(
                     f"{row['nombre']}  -  ${float(row['precio']):.2f}  |  Stock: {row['stock']}"
@@ -1241,7 +1243,7 @@ class StockGui(tk.Tk):
             listbox.delete(0, "end")
             _all_products.clear()
             q = q.lower()
-            for p in stock_app.list_products(self.conn):
+            for p in self._svc.listar_productos():
                 if not q or q in p["codigo"].lower() or q in p["nombre"].lower():
                     display = f"{p['codigo']}  -  {p['nombre']}  (${float(p['precio']):.2f})"
                     listbox.insert("end", display)
@@ -1318,10 +1320,10 @@ class StockGui(tk.Tk):
     # =========================================================================
 
     def _refresh_form_proveedor(self) -> None:
-        self._proveedor_combo["values"] = stock_app.get_all_proveedores(self.conn)
+        self._proveedor_combo["values"] = self._svc.todos_los_proveedores()
 
     def _refresh_price_proveedor(self) -> None:
-        self._price_proveedor_combo["values"] = stock_app.get_all_proveedores(self.conn)
+        self._price_proveedor_combo["values"] = self._svc.todos_los_proveedores()
 
     def _set_supplier_controls_state(self, state: str) -> None:
         for btn in (
@@ -1337,7 +1339,7 @@ class StockGui(tk.Tk):
             self._set_supplier_controls_state("disabled")
             return
         self._set_supplier_controls_state("normal")
-        for row in stock_app.get_product_suppliers(self.conn, self._edit_codigo):
+        for row in self._svc.proveedores_producto(self._edit_codigo):
             self._suppliers_table.insert(
                 "",
                 "end",
@@ -1352,7 +1354,7 @@ class StockGui(tk.Tk):
     def _sync_primary_supplier_fields(self) -> None:
         if not self._edit_codigo:
             return
-        product = stock_app.get_product(self.conn, self._edit_codigo)
+        product = self._svc.obtener_producto(self._edit_codigo)
         self.proveedor_var.set(product["proveedor"] or "")
         self.precio_costo_var.set(str(product["precio_costo"]))
 
@@ -1376,14 +1378,14 @@ class StockGui(tk.Tk):
             return
         try:
             precio_costo = parse_float(costo_raw, "precio costo")
-            stock_app.add_product_supplier(self.conn, self._edit_codigo, proveedor, precio_costo)
+            self._svc.agregar_proveedor_producto(self._edit_codigo, proveedor, precio_costo)
         except (ValueError, stock_app.StockError) as exc:
             messagebox.showerror("No se pudo agregar", str(exc))
             return
         self._sync_primary_supplier_fields()
         self._refresh_product_suppliers()
         self.refresh_products()
-        self.refresh_price_table()
+        self._refresh_visible_tabs()
         self._set_status(f"Proveedor '{proveedor}' agregado.")
 
     def _selected_supplier_id(self) -> int | None:
@@ -1400,13 +1402,13 @@ class StockGui(tk.Tk):
         if supplier_id is None:
             return
         try:
-            stock_app.set_primary_supplier(self.conn, supplier_id, self._edit_codigo)
+            self._svc.establecer_proveedor_principal(supplier_id, self._edit_codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("No se pudo actualizar", str(exc))
             return
         self._sync_primary_supplier_fields()
         self._refresh_product_suppliers()
-        self.refresh_all()
+        self._refresh_after_supplier_change()
         self._set_status("Proveedor principal actualizado.")
 
     def _remove_product_supplier(self) -> None:
@@ -1416,12 +1418,12 @@ class StockGui(tk.Tk):
         if not messagebox.askyesno("Eliminar proveedor", "Eliminar el proveedor seleccionado?"):
             return
         try:
-            stock_app.remove_product_supplier(self.conn, supplier_id)
+            self._svc.quitar_proveedor_producto(supplier_id)
         except stock_app.StockError as exc:
             messagebox.showerror("No se pudo eliminar", str(exc))
             return
         self._refresh_product_suppliers()
-        self.refresh_all()
+        self._refresh_after_supplier_change()
         self._set_status("Proveedor eliminado.")
 
     def _clear_price_filters(self) -> None:
@@ -1472,7 +1474,7 @@ class StockGui(tk.Tk):
             messagebox.showerror("Valor invalido", str(exc))
             return
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.ProductNotFoundError:
             if messagebox.askyesno(
                 "Producto no encontrado",
@@ -1666,8 +1668,8 @@ class StockGui(tk.Tk):
 
         for item in self._cart:
             try:
-                total, sale_id = stock_app.register_sale(
-                    self.conn, item["codigo"], item["cantidad"],
+                total, sale_id = self._svc.vender(
+                    item["codigo"], item["cantidad"],
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
                 processed.append({
@@ -1695,7 +1697,8 @@ class StockGui(tk.Tk):
         processed_codes = {p["codigo"] for p in processed}
         self._cart = [i for i in self._cart if i["codigo"] not in processed_codes]
         self._refresh_cart_display()
-        self.refresh_all()
+        if processed:
+            self._refresh_after_sale()
 
         total_cobrado = sum(p["total"] for p in processed)
         if processed:
@@ -1748,7 +1751,7 @@ class StockGui(tk.Tk):
             messagebox.showerror("Valor invalido", "El porcentaje debe ser mayor a 0.")
             return
 
-        sample_rows = stock_app.get_products_preview(self.conn, codigos[:3])
+        sample_rows = self._svc.vista_previa_productos(codigos[:3])
         preview_lines = "\n".join(
             f"  {row['nombre'][:25]}: ${row['precio']:.0f} -> "
             f"${round(row['precio'] * (1 + pct / 100) / 10) * 10:.0f}"
@@ -1763,7 +1766,7 @@ class StockGui(tk.Tk):
         ):
             return
 
-        changes = stock_app.bulk_price_increase(self.conn, codigos, pct)
+        changes = self._svc.aumento_masivo(codigos, pct)
         if changes:
             self._push_undo({
                 "type": "price_increase",
@@ -1771,7 +1774,7 @@ class StockGui(tk.Tk):
                 "description": f"aumento {pct:.1f}% a {len(changes)} producto(s)",
             })
             logger.info("Aumento masivo %.1f%% a %d productos", pct, len(changes))
-        self.refresh_all()
+        self._refresh_after_price_change()
         self.aumento_var.set("")
         self._set_status(f"Aumento {pct:.1f}% aplicado a {len(changes)} producto(s).")
 
@@ -1781,7 +1784,7 @@ class StockGui(tk.Tk):
             return
         codigo = self.price_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError:
             return
         self.enter_edit_mode(product)
@@ -1794,8 +1797,7 @@ class StockGui(tk.Tk):
         clear_table(self.ventas_table)
         running_total = 0.0
         if self._ventas_range_active:
-            ventas = stock_app.get_ventas_rango(
-                self.conn,
+            ventas = self._svc.ventas_rango(
                 _date_from_ui(self._ventas_desde_var.get()).isoformat(),
                 _date_from_ui(self._ventas_hasta_var.get()).isoformat(),
             )
@@ -1820,7 +1822,7 @@ class StockGui(tk.Tk):
             )
         else:
             selected_date = self._selected_ventas_date()
-            for row in stock_app.get_ventas_hoy(self.conn, cash_date=selected_date):
+            for row in self._svc.ventas_hoy(cash_date=selected_date):
                 running_total += float(row["total"])
                 self.ventas_table.insert(
                     "", "end",
@@ -1839,7 +1841,7 @@ class StockGui(tk.Tk):
 
     def _update_ventas_summary(self) -> None:
         selected_date = self._selected_ventas_date()
-        summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
+        summary = self._svc.resumen_diario(cash_date=selected_date)
         label_date = _date_to_ui(selected_date) if selected_date else _date_to_ui(date.today())
         is_today = (selected_date is None or selected_date == date.today())
         prefix = "Hoy" if is_today else label_date
@@ -1861,8 +1863,7 @@ class StockGui(tk.Tk):
         if self._ventas_range_active:
             desde = self._ventas_desde_var.get()
             hasta = self._ventas_hasta_var.get()
-            summary = stock_app.get_range_summary(
-                self.conn,
+            summary = self._svc.resumen_rango(
                 _date_from_ui(desde).isoformat(),
                 _date_from_ui(hasta).isoformat(),
             )
@@ -1872,8 +1873,8 @@ class StockGui(tk.Tk):
             ttk.Label(frame, text=f"Desde: {desde}  -  Hasta: {hasta}").pack(anchor="w")
         else:
             selected_date = self._selected_ventas_date()
-            summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
-            breakdown = stock_app.get_payment_breakdown(self.conn, cash_date=selected_date)
+            summary = self._svc.resumen_diario(cash_date=selected_date)
+            breakdown = self._svc.desglose_pagos(cash_date=selected_date)
             ttk.Label(frame, text="Cierre de caja", font=("Segoe UI", 14, "bold")).pack(anchor="w")
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(frame, text=f"Fecha: {summary['fecha']}").pack(anchor="w")
@@ -1931,7 +1932,7 @@ class StockGui(tk.Tk):
         )
         if not filepath:
             return
-        n = stock_app.export_ventas_csv(self.conn, Path(filepath))
+        n = self._svc.exportar_ventas_csv(Path(filepath))
         self._set_status(f"Exportadas {n} ventas a {Path(filepath).name}")
 
     def _export_products_csv(self) -> None:
@@ -1942,7 +1943,7 @@ class StockGui(tk.Tk):
         )
         if not filepath:
             return
-        n = stock_app.export_products_csv(self.conn, Path(filepath))
+        n = self._svc.exportar_productos_csv(Path(filepath))
         self._set_status(f"Exportados {n} productos a {Path(filepath).name}")
 
     # â”€â”€ Tab 5: reportes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2014,7 +2015,7 @@ class StockGui(tk.Tk):
         self._rep_hasta_entry.configure(state=state)
 
     def _generar_reporte_pdf(self) -> None:
-        options = {
+        options: dict[str, Any] = {
             "productos": self._rep_productos_var.get(),
             "ventas": self._rep_ventas_var.get(),
             "pendientes": self._rep_pendientes_var.get(),
@@ -2041,7 +2042,7 @@ class StockGui(tk.Tk):
                 return
 
         try:
-            import fpdf  # noqa: F401
+            import fpdf  # type: ignore[import-untyped]  # noqa: F401
         except ImportError:
             messagebox.showerror("Error", "Falta la libreria fpdf2. Ejecuta: pip install fpdf2")
             return
@@ -2091,7 +2092,7 @@ class StockGui(tk.Tk):
 
         try:
             if action["type"] == "delete_product":
-                stock_app._restore_product(self.conn, action["data"])
+                self._svc.restaurar_producto(action["data"])
                 redo_entry = {
                     "type": "redo_delete",
                     "codigo": action["data"]["codigo"],
@@ -2104,12 +2105,11 @@ class StockGui(tk.Tk):
                 sale_data: dict | None = None
                 if sale_id is not None:
                     try:
-                        row = stock_app.get_sale(self.conn, sale_id)
+                        row = self._svc.obtener_venta(sale_id)
                         sale_data = dict(row)
                     except stock_app.StockError:
                         pass
-                stock_app.reverse_sale(
-                    self.conn,
+                self._svc.revertir_venta(
                     action["codigo"],
                     action["cantidad"],
                     action["total"],
@@ -2124,7 +2124,7 @@ class StockGui(tk.Tk):
                     }
 
             elif action["type"] == "price_increase":
-                stock_app.restore_prices(self.conn, action["changes"])
+                self._svc.restaurar_precios(action["changes"])
                 redo_entry = {
                     "type": "redo_price_increase",
                     "changes": action["changes"],
@@ -2183,7 +2183,7 @@ class StockGui(tk.Tk):
             self._refresh_cart_display()
 
         self._update_undo_redo_btns()
-        self.refresh_all()
+        self._refresh_after_undo_redo(action["type"])
         self._set_status(f"Revertido: {action.get('description', '')}")
 
     def _redo(self) -> None:
@@ -2197,13 +2197,7 @@ class StockGui(tk.Tk):
             if action["type"] == "redo_delete":
                 codigo = action["codigo"]
                 try:
-                    product = stock_app.get_product(self.conn, codigo)
-                    undo_data = {k: product[k] for k in product.keys()}
-                    undo_data["suppliers"] = [
-                        {k: supplier[k] for k in supplier.keys()}
-                        for supplier in stock_app.get_product_suppliers(self.conn, codigo)
-                    ]
-                    stock_app.delete_product(self.conn, codigo)
+                    undo_data = self._svc.eliminar_producto(codigo)
                     undo_entry = {
                         "type": "delete_product",
                         "data": undo_data,
@@ -2217,7 +2211,7 @@ class StockGui(tk.Tk):
 
             elif action["type"] == "redo_sale":
                 sale_data = action["sale_data"]
-                stock_app.restore_sale(self.conn, sale_data)
+                self._svc.restaurar_venta(sale_data)
                 undo_entry = {
                     "type": "sale",
                     "codigo": sale_data["codigo"],
@@ -2229,7 +2223,7 @@ class StockGui(tk.Tk):
                 }
 
             elif action["type"] == "redo_price_increase":
-                stock_app.re_apply_prices(self.conn, action["changes"])
+                self._svc.reaplicar_precios(action["changes"])
                 undo_entry = {
                     "type": "price_increase",
                     "changes": action["changes"],
@@ -2294,7 +2288,7 @@ class StockGui(tk.Tk):
             self._refresh_cart_display()
 
         self._update_undo_redo_btns()
-        self.refresh_all()
+        self._refresh_after_undo_redo(action["type"])
         self._set_status(f"Rehecho: {action.get('description', '')}")
 
     # =========================================================================
@@ -2321,7 +2315,7 @@ class StockGui(tk.Tk):
             return
         codigo = self.products_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -2365,12 +2359,12 @@ class StockGui(tk.Tk):
                 messagebox.showerror("Valor invalido", str(exc), parent=dialog)
                 return
             try:
-                anterior = stock_app.adjust_stock(self.conn, codigo, nuevo)
+                anterior = self._svc.ajustar_stock(codigo, nuevo)
             except stock_app.StockError as exc:
                 messagebox.showerror("Error", str(exc), parent=dialog)
                 return
             dialog.destroy()
-            self.refresh_all()
+            self._refresh_after_stock_change()
             self._set_status(
                 f"Stock de '{product['nombre']}' ajustado: {anterior} -> {nuevo}"
             )
@@ -2436,8 +2430,8 @@ class StockGui(tk.Tk):
             notas = self.notas_var.get().strip()
             if not codigo or not nombre:
                 raise ValueError("Codigo y nombre son obligatorios.")
-            stock_app.add_product(
-                self.conn, codigo, nombre, precio, stock, stock_minimo,
+            self._svc.agregar_producto(
+                codigo, nombre, precio, stock, stock_minimo,
                 proveedor, precio_costo, notas,
             )
         except (ValueError, stock_app.StockError) as exc:
@@ -2446,7 +2440,7 @@ class StockGui(tk.Tk):
 
         saved_name = nombre
         self._clear_form()
-        self.refresh_all()
+        self._refresh_after_product_change()
         self._set_status(f"Producto '{saved_name}' registrado.")
 
     def _do_update_product(self) -> None:
@@ -2460,8 +2454,7 @@ class StockGui(tk.Tk):
             notas = self.notas_var.get().strip()
             if not nombre:
                 raise ValueError("El nombre es obligatorio.")
-            stock_app.update_product(
-                self.conn,
+            self._svc.actualizar_producto(
                 self._edit_codigo,  # type: ignore[arg-type]
                 nombre, precio, stock, stock_minimo,
                 proveedor, precio_costo, notas,
@@ -2472,7 +2465,7 @@ class StockGui(tk.Tk):
 
         saved_name = nombre
         self.cancel_edit()
-        self.refresh_all()
+        self._refresh_after_product_change()
         self._set_status(f"Producto '{saved_name}' actualizado.")
 
     def enter_edit_mode(self, product: sqlite3.Row) -> None:
@@ -2520,7 +2513,7 @@ class StockGui(tk.Tk):
             return
         codigo = self.products_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -2538,13 +2531,7 @@ class StockGui(tk.Tk):
         ):
             return
         try:
-            product = stock_app.get_product(self.conn, codigo)
-            undo_data = {k: product[k] for k in product.keys()}
-            undo_data["suppliers"] = [
-                {k: supplier[k] for k in supplier.keys()}
-                for supplier in stock_app.get_product_suppliers(self.conn, codigo)
-            ]
-            stock_app.delete_product(self.conn, codigo)
+            undo_data = self._svc.eliminar_producto(codigo)
             logger.info("Producto eliminado: %s", codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
@@ -2557,7 +2544,7 @@ class StockGui(tk.Tk):
         })
         if self._edit_mode and self._edit_codigo == codigo:
             self.cancel_edit()
-        self.refresh_all()
+        self._refresh_after_product_change()
 
     # =========================================================================
     # Sale
@@ -2568,9 +2555,14 @@ class StockGui(tk.Tk):
         forma_pago = self._venta_forma_pago_var.get() or "Efectivo"
         try:
             cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
-            sale_date = date.today()
-            total, sale_id = stock_app.register_sale(
-                self.conn, codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
+        except ValueError as exc:
+            messagebox.showerror("No se pudo registrar", str(exc))
+            return
+
+        sale_date = date.today()
+        try:
+            total, sale_id = self._svc.vender(
+                codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
             )
         except stock_app.ProductNotFoundError:
             if messagebox.askyesno(
@@ -2587,8 +2579,8 @@ class StockGui(tk.Tk):
             if not allow:
                 return
             try:
-                total, sale_id = stock_app.register_sale(
-                    self.conn, codigo, cantidad, allow_negative=True,
+                total, sale_id = self._svc.vender(
+                    codigo, cantidad, allow_negative=True,
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
             except (ValueError, stock_app.StockError) as retry_exc:
@@ -2611,7 +2603,7 @@ class StockGui(tk.Tk):
         })
         self.venta_codigo_var.set("")
         self.venta_cantidad_var.set("1")
-        self.refresh_all()
+        self._refresh_after_sale()
         logger.info("Venta: %s x%d $%.2f", codigo, cantidad, total)
         self._set_status(f"Venta registrada [{forma_pago}] - Total: ${total:.2f}")
         self._venta_codigo_entry.focus_set()
@@ -2625,9 +2617,9 @@ class StockGui(tk.Tk):
         if not descripcion:
             messagebox.showerror("Dato obligatorio", "Ingrese una descripcion.")
             return
-        stock_app.add_pending(self.conn, descripcion)
+        self._svc.agregar_pendiente(descripcion)
         self.pendiente_var.set("")
-        self.refresh_pending()
+        self._refresh_after_pending_change()
         self._set_status("Pendiente agregado.")
 
     def complete_selected_pending(self) -> None:
@@ -2636,8 +2628,8 @@ class StockGui(tk.Tk):
             messagebox.showerror("Seleccione un pendiente", "Elija un item de la lista.")
             return
         pending_id = int(selected[0])
-        stock_app.complete_pending(self.conn, pending_id)
-        self.refresh_pending()
+        self._svc.completar_pendiente(pending_id)
+        self._refresh_after_pending_change()
 
     def delete_selected_pending(self) -> None:
         selected = self.pending_table.selection()
@@ -2647,8 +2639,8 @@ class StockGui(tk.Tk):
         pending_id = int(selected[0])
         if not messagebox.askyesno("Confirmar", "Eliminar este pendiente definitivamente?"):
             return
-        stock_app.delete_pending(self.conn, pending_id)
-        self.refresh_pending()
+        self._svc.eliminar_pendiente(pending_id)
+        self._refresh_after_pending_change()
 
     # =========================================================================
     # Refresh
@@ -2658,21 +2650,76 @@ class StockGui(tk.Tk):
         self.refresh_products()
         self.refresh_alerts()
         self.refresh_pending()
-        self.caja_var.set(f"Caja de hoy: ${stock_app.daily_cash(self.conn):.2f}")
-        self._update_ventas_summary()
+        self._update_caja_y_ventas()
         self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_visible_tabs(self) -> None:
         idx = self._notebook.index("current")
         if idx == 2:
             self.refresh_price_table()
         elif idx == 3:
             self.refresh_ventas()
 
+    def _update_caja_y_ventas(self) -> None:
+        self.caja_var.set(f"Caja de hoy: ${self._svc.caja_hoy():.2f}")
+        self._update_ventas_summary()
+
+    def _refresh_after_sale(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._update_caja_y_ventas()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_product_change(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_price_change(self) -> None:
+        self.refresh_products()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_stock_change(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+
+    def _refresh_after_supplier_change(self) -> None:
+        self.refresh_products()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_pending_change(self) -> None:
+        self.refresh_pending()
+        self._refresh_dashboard()
+
+    def _refresh_after_import(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_undo_redo(self, action_type: str) -> None:
+        if action_type in ("sale", "redo_sale"):
+            self._refresh_after_sale()
+        elif action_type in ("delete_product", "redo_delete"):
+            self._refresh_after_product_change()
+        elif action_type in ("price_increase", "redo_price_increase"):
+            self._refresh_after_price_change()
+        elif action_type in ("cart_change", "cart_remove", "cart_clear",
+                             "redo_cart_remove", "redo_cart_clear"):
+            return
+        else:
+            self.refresh_all()
+
     def refresh_products(self) -> None:
         clear_table(self.products_table)
         query = self.search_var.get().strip()
 
         rows_data = []
-        for row in stock_app.search_products(self.conn, query):
+        for row in self._svc.buscar_productos(query):
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
             margen = _calc_margen(precio, costo)
@@ -2719,7 +2766,7 @@ class StockGui(tk.Tk):
 
     def refresh_alerts(self) -> None:
         clear_table(self.alerts_table)
-        for row in stock_app.low_stock_products(self.conn):
+        for row in self._svc.stock_bajo():
             tag = "critical" if row["stock"] <= 0 else "warning"
             self.alerts_table.insert(
                 "", "end",
@@ -2729,7 +2776,7 @@ class StockGui(tk.Tk):
 
     def refresh_pending(self) -> None:
         clear_table(self.pending_table)
-        for row in stock_app.list_pending(self.conn):
+        for row in self._svc.listar_pendientes():
             self.pending_table.insert(
                 "", "end",
                 iid=str(row["id"]),
@@ -2740,7 +2787,7 @@ class StockGui(tk.Tk):
         clear_table(self.price_table)
         text_filter = self.price_search_var.get().strip()
         prov_filter = self.price_proveedor_var.get().strip().lower()
-        for row in stock_app.search_products(self.conn, text_filter):
+        for row in self._svc.buscar_productos(text_filter):
             if prov_filter and prov_filter not in (row["proveedor"] or "").lower():
                 continue
             precio = float(row["precio"])
@@ -2840,7 +2887,7 @@ class StockGui(tk.Tk):
     # =========================================================================
 
     def _select_boleta_proveedor(self) -> str | None:
-        proveedores = stock_app.get_all_proveedores(self.conn)
+        proveedores = self._svc.todos_los_proveedores()
         new_option = "+ Nuevo proveedor..."
         values = proveedores + [new_option]
         result: dict[str, str | None] = {"value": None}
@@ -2923,8 +2970,7 @@ class StockGui(tk.Tk):
             return
 
         try:
-            result = stock_app.parse_and_classify_boleta(
-                self.conn,
+            result = self._svc.clasificar_boleta(
                 Path(filepath),
                 default_proveedor=proveedor_boleta,
             )
@@ -2942,7 +2988,7 @@ class StockGui(tk.Tk):
         n_clean = len(result.rows_clean)
         errors: list[str] = []
         if result.rows_new or result.rows_clean:
-            _, errors = stock_app.apply_boleta_batch(self.conn, result.rows_new + result.rows_clean)
+            _, errors = self._svc.aplicar_lote_boleta(result.rows_new + result.rows_clean)
 
         def _skipped_detail() -> str:
             if not result.skipped:
@@ -2967,7 +3013,7 @@ class StockGui(tk.Tk):
             return text, bool(errors or result.skipped)
 
         def _on_conflicts_done() -> None:
-            self.refresh_all()
+            self._refresh_after_import()
             summary, has_detail = _build_summary(with_conflicts=True)
             logger.info(
                 "Boleta importada: %d nuevos, %d actualizados",
@@ -2992,7 +3038,7 @@ class StockGui(tk.Tk):
                 self._set_status(f"Importacion completada - {summary}")
 
         if not result.rows_conflict:
-            self.refresh_all()
+            self._refresh_after_import()
             summary, has_detail = _build_summary(with_conflicts=False)
             logger.info("Boleta importada: %d nuevos, %d actualizados", n_new, n_clean)
             if has_detail:
@@ -3024,7 +3070,7 @@ class ConflictoDialog:
         parent: StockGui,
         conflicts: list,
         conn: sqlite3.Connection,
-        on_complete: object,
+        on_complete: Callable[[], None],
     ) -> None:
         self._parent = parent
         self._conflicts = conflicts

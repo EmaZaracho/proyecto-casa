@@ -1193,8 +1193,192 @@ def re_apply_prices(conn: sqlite3.Connection, changes: list[tuple[str, float, fl
             )
 
 
-# ── CLI helpers ───────────────────────────────────────────────────────────────
+# Service facade
+class StockService:
+    """Fachada de operaciones de negocio sobre una conexion SQLite."""
 
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def buscar_productos(self, query: str = "") -> list[sqlite3.Row]:
+        return search_products(self._conn, query)
+
+    def obtener_producto(self, codigo: str) -> sqlite3.Row:
+        return get_product(self._conn, codigo)
+
+    def agregar_producto(
+        self,
+        codigo: str,
+        nombre: str,
+        precio: float,
+        stock: int,
+        stock_minimo: int,
+        proveedor: str = "",
+        precio_costo: float = 0.0,
+        notas: str = "",
+    ) -> None:
+        add_product(
+            self._conn, codigo, nombre, precio, stock, stock_minimo,
+            proveedor, precio_costo, notas,
+        )
+
+    def actualizar_producto(
+        self,
+        codigo: str,
+        nombre: str,
+        precio: float,
+        stock: int,
+        stock_minimo: int,
+        proveedor: str = "",
+        precio_costo: float = 0.0,
+        notas: str = "",
+        motivo: str = "Edicion manual",
+    ) -> None:
+        update_product(
+            self._conn, codigo, nombre, precio, stock, stock_minimo,
+            proveedor, precio_costo, notas, motivo,
+        )
+
+    def eliminar_producto(self, codigo: str) -> dict:
+        product = get_product(self._conn, codigo)
+        data = {k: product[k] for k in product.keys()}
+        data["suppliers"] = [
+            {k: supplier[k] for k in supplier.keys()}
+            for supplier in get_product_suppliers(self._conn, codigo)
+        ]
+        delete_product(self._conn, codigo)
+        return data
+
+    def restaurar_producto(self, data: dict) -> None:
+        _restore_product(self._conn, data)
+
+    def stock_bajo(self) -> list[sqlite3.Row]:
+        return low_stock_products(self._conn)
+
+    def ajustar_stock(self, codigo: str, nuevo_stock: int) -> int:
+        return adjust_stock(self._conn, codigo, nuevo_stock)
+
+    def proveedores_producto(self, codigo: str) -> list[sqlite3.Row]:
+        return get_product_suppliers(self._conn, codigo)
+
+    def todos_los_proveedores(self) -> list[str]:
+        return get_all_proveedores(self._conn)
+
+    def agregar_proveedor_producto(
+        self,
+        codigo: str,
+        proveedor: str,
+        precio_costo: float,
+    ) -> None:
+        add_product_supplier(self._conn, codigo, proveedor, precio_costo)
+
+    def establecer_proveedor_principal(self, supplier_id: int, codigo: str) -> None:
+        set_primary_supplier(self._conn, supplier_id, codigo)
+
+    def quitar_proveedor_producto(self, supplier_id: int) -> None:
+        remove_product_supplier(self._conn, supplier_id)
+
+    def vender(
+        self,
+        codigo: str,
+        cantidad: int,
+        forma_pago: str,
+        allow_negative: bool = False,
+        sale_date: date | None = None,
+    ) -> tuple[float, int]:
+        return register_sale(
+            self._conn, codigo, cantidad,
+            allow_negative=allow_negative,
+            sale_date=sale_date,
+            forma_pago=forma_pago,
+        )
+
+    def obtener_venta(self, sale_id: int) -> sqlite3.Row:
+        return get_sale(self._conn, sale_id)
+
+    def revertir_venta(
+        self,
+        codigo: str,
+        cantidad: int,
+        total: float,
+        sale_date: str,
+        sale_id: int | None = None,
+    ) -> None:
+        reverse_sale(self._conn, codigo, cantidad, total, sale_date, sale_id=sale_id)
+
+    def restaurar_venta(self, sale_data: dict) -> None:
+        restore_sale(self._conn, sale_data)
+
+    def aumento_masivo(self, codigos: list[str], pct: float) -> list[tuple]:
+        return bulk_price_increase(self._conn, codigos, pct)
+
+    def restaurar_precios(self, changes: list[tuple[str, float, float]]) -> None:
+        restore_prices(self._conn, changes)
+
+    def reaplicar_precios(self, changes: list[tuple[str, float, float]]) -> None:
+        re_apply_prices(self._conn, changes)
+
+    def agregar_pendiente(self, descripcion: str) -> None:
+        add_pending(self._conn, descripcion)
+
+    def completar_pendiente(self, pid: int) -> bool:
+        return complete_pending(self._conn, pid)
+
+    def eliminar_pendiente(self, pid: int) -> bool:
+        return delete_pending(self._conn, pid)
+
+    def listar_pendientes(self) -> list[sqlite3.Row]:
+        return list_pending(self._conn)
+
+    def caja_hoy(self) -> float:
+        return daily_cash(self._conn)
+
+    def listar_productos(self) -> list[sqlite3.Row]:
+        return list_products(self._conn)
+
+    def ventas_hoy(self, cash_date: date | None = None) -> list[sqlite3.Row]:
+        return get_ventas_hoy(self._conn, cash_date)
+
+    def ventas_rango(self, desde_iso: str, hasta_iso: str) -> list[sqlite3.Row]:
+        return get_ventas_rango(self._conn, desde_iso, hasta_iso)
+
+    def resumen_diario(self, cash_date: date | None = None) -> dict:
+        return get_daily_summary(self._conn, cash_date)
+
+    def resumen_rango(self, desde_iso: str, hasta_iso: str) -> dict:
+        return get_range_summary(self._conn, desde_iso, hasta_iso)
+
+    def desglose_pagos(self, cash_date: date | None = None) -> list[sqlite3.Row]:
+        return get_payment_breakdown(self._conn, cash_date)
+
+    def historial_precios(self, query: str = "") -> list[sqlite3.Row]:
+        return search_price_history(self._conn, query)
+
+    def vista_previa_productos(self, codigos: list[str]) -> list[sqlite3.Row]:
+        return get_products_preview(self._conn, codigos)
+
+    def exportar_ventas_csv(self, filepath: Path) -> int:
+        return export_ventas_csv(self._conn, filepath)
+
+    def exportar_productos_csv(self, filepath: Path) -> int:
+        return export_products_csv(self._conn, filepath)
+
+    def clasificar_boleta(
+        self, filepath: Path, default_proveedor: str = ""
+    ) -> object:
+        return parse_and_classify_boleta(
+            self._conn, filepath, default_proveedor=default_proveedor
+        )
+
+    def aplicar_lote_boleta(self, rows: list) -> tuple[int, list[str]]:
+        return apply_boleta_batch(self._conn, rows)
+
+    @staticmethod
+    def backup() -> None:
+        backup_database()
+
+
+# CLI helpers
 def read_text(prompt: str, required: bool = True) -> str:
     while True:
         value = input(prompt).strip()

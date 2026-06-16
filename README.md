@@ -10,8 +10,10 @@ Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de 
 - Proveedores normalizados en `proveedores_producto`; `productos.proveedor` y `productos.precio_costo` quedan como cache del proveedor principal.
 - SQLite abre con `PRAGMA foreign_keys=ON` y `PRAGMA journal_mode=WAL`.
 - Operaciones criticas de escritura usan transacciones con `with conn:`.
+- `StockService` centraliza operaciones de negocio usadas por la GUI.
 - Undo/redo esta encapsulado en `UndoManager`.
-- Generacion de PDF esta encapsulada en `ReportGenerator`.
+- Generacion de PDF esta encapsulada en `ReportGenerator`, que lee config fresca al generar.
+- Las acciones de la GUI usan refresh selectivo para evitar recargar vistas no afectadas.
 - Suite actual: 89 tests con `unittest`.
 
 ## Requisitos
@@ -100,7 +102,7 @@ El ejecutable se genera en `dist\SistemaDeStock.exe`.
 
 ## Archivos principales
 
-- `stock_app.py`: capa de datos, migraciones, logica de negocio y funciones puras.
+- `stock_app.py`: capa de datos, migraciones, logica de negocio y `StockService`.
 - `stock_gui.py`: interfaz Tkinter, orquestacion de flujos, undo/redo y reportes.
 - `test_stock_app.py`: tests unitarios y tests GUI cuando hay display disponible.
 - `requirements.txt`: dependencias Python.
