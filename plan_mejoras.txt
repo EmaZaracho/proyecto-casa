@@ -1,202 +1,482 @@
-PLAN DE MEJORAS — Sistema de Stock
-====================================
-Fecha: 2026-06-15
+PLAN DE MEJORAS ARQUITECTURALES — Sistema de Stock
+====================================================
+Fecha: 2026-06-16
+Rama de trabajo: prueba-de-refactorizacion
 
 CONTEXTO
 --------
-Las tres funcionalidades de UX priorizadas a implementar:
-  Feat 2 — Foco automático en campo de código al volver a Principal (soporte lector de barras)
-  Feat 3 — Pestaña Resumen / Dashboard con ventas del día y alertas de stock
-  Feat 7 — Notificaciones no bloqueantes (toast via status bar) en lugar de showinfo modales
+Análisis del knowledge graph identificó tres problemas arquitecturales
+que no son bugs inmediatos pero degradan el sistema a medida que crece:
 
-Estado: IMPLEMENTADAS (todas en stock_gui.py, 2026-06-15)
+  1. refresh_all() indiscriminado  — re-lee toda la DB en cada acción
+  2. Sin capa de abstracción       — StockGui llama stock_app en ~40 puntos
+  3. ReportGenerator._config       — referencia frágil al dict de config
 
 
 ======================================================================
-FEAT 2 — FOCO AUTOMÁTICO EN CÓDIGO DE VENTA
+MEJORA 1 — REFRESH SELECTIVO
 ======================================================================
 
 Problema
 --------
-Al volver a la pestaña Principal (después de consultar ventas, precios,
-etc.), el foco de teclado queda en ningún lado. Con un lector de barras
-USB (que actúa como teclado) hay que hacer click manualmente antes de
-escanear.
+refresh_all() ejecuta 6-7 queries + reconstruye todos los Treeviews
+en respuesta a CUALQUIER acción del usuario. Si el usuario está en la
+pestaña de precios (idx == 2), search_products() se llama DOS VECES
+(una en refresh_products y otra en refresh_price_table).
 
-Cambio implementado
+Llamadas actuales a refresh_all() (~15 sitios):
+  - register_sale          - _undo / _redo
+  - _cobrar_carrito        - _apply_price_increase
+  - save_product (add)     - save_product (edit)
+  - delete_product         - _show_ajuste_stock (dialog OK)
+  - _add_product_supplier  - _set_primary_supplier
+  - _remove_supplier       - _import_boleta_csv
+
+Plan
+----
+Definir qué datos cambia cada operación y llamar solo lo necesario.
+Mantener refresh_all() solo para startup y botón "Actualizar lista".
+
+Mapa operación → refreshes necesarios:
+
+  | Operación                  | refresh_products | refresh_alerts | refresh_pending | caja/ventas_summary | refresh_dashboard | refresh_price_table | refresh_ventas |
+  |----------------------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+  | register_sale              |  ✓  |  ✓  |     |  ✓  |  ✓  |  si visible  |  si visible  |
+  | _cobrar_carrito            |  ✓  |  ✓  |     |  ✓  |  ✓  |  si visible  |  si visible  |
+  | save_product (add/edit)    |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
+  | delete_product             |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
+  | _apply_price_increase      |  ✓  |     |     |     |     |  si visible  |     |
+  | _show_ajuste_stock         |  ✓  |  ✓  |     |     |  ✓  |              |     |
+  | add_pending / del_pending  |     |     |  ✓  |     |  ✓  |              |     |
+  | _add/set/remove_supplier   |  ✓  |     |     |     |     |  si visible  |     |
+  | _import_boleta_csv         |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
+  | _undo / _redo              | según tipo de acción deshecha/rehecha    |
+
+Implementación
+--------------
+Agregar método auxiliar que solo refresca las pestañas opcionales si
+están visibles (evita el doble-query en precios):
+
+  def _refresh_visible_tabs(self) -> None:
+      idx = self._notebook.index("current")
+      if idx == 2:
+          self.refresh_price_table()
+      elif idx == 3:
+          self.refresh_ventas()
+
+Reemplazar cada refresh_all() con las llamadas específicas del mapa.
+Ejemplo para register_sale():
+
+  # ANTES
+  self.refresh_all()
+
+  # DESPUÉS
+  self.refresh_products()
+  self.refresh_alerts()
+  self._update_caja_y_ventas()   # caja_var + _update_ventas_summary
+  self._refresh_dashboard()
+  self._refresh_visible_tabs()
+
+Para _undo y _redo: el tipo de acción ya está disponible en el dict,
+así que se puede ramificar:
+
+  if action["type"] in ("sale", "redo_sale"):
+      self.refresh_products()
+      self.refresh_alerts()
+      self._update_caja_y_ventas()
+      self._refresh_dashboard()
+      self._refresh_visible_tabs()
+  elif action["type"] in ("delete_product", "redo_delete"):
+      self.refresh_products()
+      self.refresh_alerts()
+      self._refresh_dashboard()
+      self._refresh_visible_tabs()
+  elif action["type"] == "price_increase":
+      self.refresh_products()
+      self._refresh_visible_tabs()
+  elif action["type"].startswith("cart_"):
+      self._refresh_cart_display()   # ya existente, sin queries extra
+
+
+======================================================================
+MEJORA 2 — CAPA DE SERVICIO (StockService)
+======================================================================
+
+Problema
+--------
+StockGui llama directamente a stock_app.* en ~40 sitios, pasando
+self.conn en cada llamada. No hay un punto único de cambio cuando
+evoluciona la API de stock_app. Los tests de GUI deben conocer la
+implementación interna de stock_app para funcionar.
+
+Plan
+----
+Crear clase StockService en stock_app.py que encapsule las operaciones
+de negocio. StockGui pasa a usar self._svc en lugar de stock_app.*
+
+Clase a agregar al final de stock_app.py:
+
+  class StockService:
+      """Fachada de operaciones de negocio sobre una conexión SQLite."""
+
+      def __init__(self, conn: sqlite3.Connection) -> None:
+          self._conn = conn
+
+      # ── Productos ──────────────────────────────────────────────────
+      def buscar_productos(self, query: str = "") -> list[sqlite3.Row]:
+          return search_products(self._conn, query)
+
+      def obtener_producto(self, codigo: str) -> sqlite3.Row:
+          return get_product(self._conn, codigo)
+
+      def agregar_producto(self, codigo, nombre, precio, stock,
+                           stock_minimo, proveedor="", precio_costo=0.0,
+                           notas="") -> None:
+          add_product(self._conn, codigo, nombre, precio, stock,
+                      stock_minimo, proveedor, precio_costo, notas)
+
+      def actualizar_producto(self, codigo, nombre, precio, stock,
+                              stock_minimo, proveedor="", precio_costo=0.0,
+                              notas="", motivo="Edición manual") -> None:
+          update_product(self._conn, codigo, nombre, precio, stock,
+                         stock_minimo, proveedor, precio_costo, notas, motivo)
+
+      def eliminar_producto(self, codigo: str) -> dict:
+          """Elimina el producto y devuelve sus datos + proveedores para undo."""
+          product = get_product(self._conn, codigo)
+          data = {k: product[k] for k in product.keys()}
+          data["suppliers"] = [
+              {k: s[k] for k in s.keys()}
+              for s in get_product_suppliers(self._conn, codigo)
+          ]
+          delete_product(self._conn, codigo)
+          return data
+
+      def restaurar_producto(self, data: dict) -> None:
+          _restore_product(self._conn, data)
+
+      def stock_bajo(self) -> list[sqlite3.Row]:
+          return low_stock_products(self._conn)
+
+      def ajustar_stock(self, codigo: str, nuevo_stock: int) -> int:
+          return adjust_stock(self._conn, codigo, nuevo_stock)
+
+      # ── Ventas ─────────────────────────────────────────────────────
+      def vender(self, codigo: str, cantidad: int, forma_pago: str,
+                 allow_negative: bool = False,
+                 sale_date: date | None = None) -> tuple[float, int]:
+          return register_sale(self._conn, codigo, cantidad,
+                               allow_negative=allow_negative,
+                               sale_date=sale_date, forma_pago=forma_pago)
+
+      def revertir_venta(self, codigo, cantidad, total,
+                         sale_date, sale_id=None) -> None:
+          reverse_sale(self._conn, codigo, cantidad, total,
+                       sale_date, sale_id=sale_id)
+
+      def ventas_hoy(self, cash_date=None) -> list[sqlite3.Row]:
+          return get_ventas_hoy(self._conn, cash_date)
+
+      def resumen_diario(self, cash_date=None) -> dict:
+          return get_daily_summary(self._conn, cash_date)
+
+      # ── Precios ────────────────────────────────────────────────────
+      def aumento_masivo(self, codigos: list[str],
+                         pct: float) -> list[tuple]:
+          return bulk_price_increase(self._conn, codigos, pct)
+
+      def restaurar_precios(self, changes) -> None:
+          restore_prices(self._conn, changes)
+
+      def todos_los_proveedores(self) -> list[str]:
+          return get_all_proveedores(self._conn)
+
+      # ── Pendientes ─────────────────────────────────────────────────
+      def agregar_pendiente(self, descripcion: str) -> None:
+          add_pending(self._conn, descripcion)
+
+      def completar_pendiente(self, pid: int) -> bool:
+          return complete_pending(self._conn, pid)
+
+      def eliminar_pendiente(self, pid: int) -> bool:
+          return delete_pending(self._conn, pid)
+
+      def listar_pendientes(self) -> list[sqlite3.Row]:
+          return list_pending(self._conn)
+
+      # ── Caja ───────────────────────────────────────────────────────
+      def caja_hoy(self) -> float:
+          return daily_cash(self._conn)
+
+Cambios en StockGui
 -------------------
-En _on_tab_changed() — cuando el índice activo es 1 (Principal):
+En __init__, reemplazar:
+  self.conn = stock_app.get_connection()
+  stock_app.initialize_database(self.conn)
+por:
+  self.conn = stock_app.get_connection()
+  stock_app.initialize_database(self.conn)
+  self._svc = stock_app.StockService(self.conn)
 
-  elif idx == 1:
-      self.after(50, self._venta_codigo_entry.focus_set)
+Migrar llamadas de mayor impacto primero (por frecuencia de cambio):
+  stock_app.register_sale(self.conn, ...)       → self._svc.vender(...)
+  stock_app.delete_product(self.conn, codigo)   → self._svc.eliminar_producto(codigo)
+  stock_app.bulk_price_increase(self.conn, ...) → self._svc.aumento_masivo(...)
+  stock_app.add_product(self.conn, ...)         → self._svc.agregar_producto(...)
+  stock_app.update_product(self.conn, ...)      → self._svc.actualizar_producto(...)
+  stock_app.get_all_proveedores(self.conn)      → self._svc.todos_los_proveedores()
 
-El after(50) da tiempo al Notebook de terminar la animación de cambio
-de pestaña antes de aplicar el foco.
+La lógica de captura de datos para undo de eliminar_producto se mueve
+DENTRO de self._svc.eliminar_producto() — el GUI solo recibe el dict:
 
-Archivos modificados
---------------------
-  stock_gui.py — método _on_tab_changed (índices actualizados tras
-                 agregar Dashboard en posición 0)
+  # ANTES (en stock_gui.py, ~10 líneas duplicadas en 2 lugares)
+  product = stock_app.get_product(self.conn, codigo)
+  undo_data = {k: product[k] for k in product.keys()}
+  undo_data["suppliers"] = [...]
+  stock_app.delete_product(self.conn, codigo)
 
-Verificación
-------------
-1. Abrir app → pestaña Resumen visible (Dashboard en índice 0)
-2. Navegar a Ventas del día → volver a Principal
-3. Escribir un código o conectar lector de barras → código se captura
-   sin necesidad de click previo
+  # DESPUÉS (1 línea)
+  undo_data = self._svc.eliminar_producto(codigo)
 
-
-======================================================================
-FEAT 3 — PESTAÑA RESUMEN (DASHBOARD)
-======================================================================
-
-Problema
---------
-Para conocer el estado del negocio hay que navegar por múltiples
-pestañas. No existe una vista consolidada al abrir la app.
-
-Diseño implementado
--------------------
-Nueva pestaña "Resumen" en posición 0 (primera al abrir la app).
-Tres secciones:
-
-  A. Ventas de hoy
-     - Total vendido (texto grande estilo Title.TLabel)
-     - Cantidad de ventas
-     - Desglose por forma de pago (Efectivo / Débito / etc.)
-     Usa: get_daily_summary(conn) + get_payment_breakdown(conn)
-
-  B. Alertas de stock
-     - Label con conteo: "🔴 N sin stock  |  🟡 N bajo mínimo"
-     - Treeview con hasta 10 productos (críticos primero, luego bajos)
-       Columnas: Código | Nombre | Stock
-     Usa: search_products(conn) filtrando stock <= stock_minimo
-
-  C. Acceso rápido
-     - Botón "🧾 Nueva venta (F1)" → selecciona tab Principal + foco en código
-     - Botón "🔍 Buscar producto" → selecciona tab Principal + foco en búsqueda
-     - Botón "📦 Nuevo producto (F2)" → selecciona tab Principal + abre formulario
-
-Métodos agregados
------------------
-  _build_tab_dashboard(frame) — construye los widgets del Dashboard
-  _refresh_dashboard()        — actualiza todos los datos del Dashboard
-
-Variables de instancia nuevas
-------------------------------
-  self._dash_total_var    — StringVar para total del día
-  self._dash_count_var    — StringVar para cantidad de ventas
-  self._dash_pagos_var    — StringVar para desglose por pago
-  self._dash_alert_var    — StringVar para label de alertas
-  self._dash_stock_list   — Treeview de productos con stock bajo
-  self._product_search_entry — Entry de búsqueda de productos (antes
-                               era local; ahora guardado como atributo
-                               para poder focusearlo desde Dashboard)
-
-Archivos modificados
---------------------
-  stock_gui.py
-    _build_layout        — agrega tab0 antes de tab1, llama _build_tab_dashboard
-    _build_tab_principal — guarda search entry como self._product_search_entry
-    _on_tab_changed      — índices actualizados (+1 en todos); idx=0 llama _refresh_dashboard
-    refresh_all          — llama _refresh_dashboard() + índices actualizados
-    _build_tab_dashboard — nuevo
-    _refresh_dashboard   — nuevo
-
-Consideración de índices
-------------------------
-Al agregar Dashboard en posición 0, todos los índices suben en 1:
-  0: Resumen (Dashboard)    — antes no existía
-  1: Principal              — antes era 0
-  2: Gestión de precios     — antes era 1
-  3: Ventas del día         — antes era 2
-  4: Historial de precios   — antes era 3
-  5: Reportes               — antes era 4
-
-Verificación
-------------
-1. Abrir app → pestaña Resumen es la primera (automático)
-2. Registrar una venta → volver a Resumen → total y count actualizados
-3. Reducir stock de un producto a 0 → aparece en lista de alertas
-4. Botón "Nueva venta" → lleva a Principal con foco en código
-5. Botón "Buscar producto" → lleva a Principal con foco en búsqueda
+Nota: no hace falta migrar las 40 llamadas de una sola vez. Se puede
+hacer incrementalmente, priorizando las operaciones más complejas.
+Las llamadas simples de solo lectura (search_products, list_products,
+get_price_history, etc.) pueden mantenerse como están o migrarse
+en una segunda pasada.
 
 
 ======================================================================
-FEAT 7 — TOAST NOTIFICATIONS (STATUS BAR)
+MEJORA 3 — REPORTGENERATOR: ELIMINAR REFERENCIA FRÁGIL
 ======================================================================
 
 Problema
 --------
-Los messagebox.showinfo de éxito son modales: bloquean la app y
-requieren un click para cerrarlos. Para flujos rápidos (importar
-boleta, cobrar carrito) interrumpen el ritmo de trabajo.
+ReportGenerator guarda self._config = config en __init__, que es una
+referencia al mismo dict que StockGui._config. Funciona hoy porque
+la config solo se muta (nunca se reasigna). Pero si alguien hace
+self._config = stock_app.load_config() para refrescar la config,
+ReportGenerator queda con datos viejos sin ninguna señal de error.
 
-Solución implementada
----------------------
-Ya existía _set_status(msg, ms=3000) que muestra texto en la status
-bar por 3 segundos y se borra solo. Estaba infrautilizado.
+Plan
+----
+ReportGenerator lee la config directamente de disco en cada generación.
+El archivo config.json es pequeño (~100 bytes) — el costo de leerlo
+una vez por PDF es despreciable.
 
-Criterio aplicado:
-  showinfo de ÉXITO sin detalles → _set_status("✓ mensaje")
-  showinfo con errores / filas ignoradas → messagebox.showinfo (el
-    usuario necesita revisar los detalles)
-  showerror y askyesno → siempre modal (errores y confirmaciones
-    requieren atención explícita)
+Cambio en ReportGenerator.__init__:
 
-Cambios en importación de boleta (_import_boleta_csv)
-------------------------------------------------------
-  - "Sin datos: CSV sin filas válidas" → _set_status
-  - Importación completada sin errores ni filas ignoradas → _set_status
-  - Importación completada CON errores o filas ignoradas → showinfo
-    (el detalle importa)
+  # ANTES
+  def __init__(self, conn: sqlite3.Connection, config: dict) -> None:
+      self._conn = conn
+      self._config = config
 
-  Lógica auxiliar agregada: _build_summary(with_conflicts) devuelve
-  (resumen_corto, tiene_detalles_largos) para decidir qué usar.
+  # DESPUÉS
+  def __init__(self, conn: sqlite3.Connection) -> None:
+      self._conn = conn
 
-Cobro de carrito (_cobrar_carrito)
-----------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
+Cambio en ReportGenerator.generate():
 
-Aumento de precios (_apply_price_increase)
-------------------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
+  # ANTES
+  def generate(self, filepath: str, options: dict) -> None:
+      from fpdf import FPDF
+      pdf = FPDF()
+      ...
+      self._draw_header(pdf, self._config.get("nombre_negocio", "Reporte"))
 
-Ajuste de stock (_show_adjust_stock_dialog)
--------------------------------------------
-Ya usaba _set_status correctamente. Sin cambio.
+  # DESPUÉS
+  def generate(self, filepath: str, options: dict) -> None:
+      from fpdf import FPDF
+      config = stock_app.load_config()   # lee fresco en cada generación
+      pdf = FPDF()
+      ...
+      self._draw_header(pdf, config.get("nombre_negocio", "Reporte"))
+      # pasar config a los métodos que lo necesiten (_moneda, etc.)
 
-Archivos modificados
---------------------
-  stock_gui.py — _import_boleta_csv (3 bloques cambiados)
+Adaptar _moneda y _draw_header para recibir config como parámetro
+en lugar de leerlo de self._config:
 
-Verificación
-------------
-1. Importar CSV con productos nuevos sin conflictos → toast en status bar,
-   no aparece popup modal
-2. Importar CSV con filas ignoradas → showinfo modal con detalle
-3. Importar CSV con errores → showinfo modal con detalle
-4. Cobrar carrito → toast en status bar (ya funcionaba)
-5. showerror por código inválido → sigue siendo modal
+  def _section_productos(self, pdf, moneda: str) -> None: ...
+  def _section_ventas(self, pdf, desde, hasta, moneda: str) -> None: ...
+
+Cambio en StockGui.__init__:
+
+  # ANTES
+  self._report_gen = ReportGenerator(self.conn, self._config)
+
+  # DESPUÉS
+  self._report_gen = ReportGenerator(self.conn)
+
+Con esto, StockGui ya no necesita pasar self._config al constructor —
+se elimina el acoplamiento entre el ciclo de vida del dict de config
+y el generador de PDF.
 
 
 ======================================================================
-PENDIENTES / IDEAS FUTURAS
+MEJORA 4 — ERRORES DE TIPOS PYLANCE (stock_gui.py)
 ======================================================================
 
-Feat 1 — Ticket post-venta
---------------------------
-Popup con detalle itemizado después de cobrar (artículos, subtotales,
-total, forma de pago, fecha). Opción para imprimir o copiar como texto.
-Requiere: ningún cambio de schema. Solo UI en _cobrar_carrito.
+Son 4 errores reales y 1 warning de import. Todos en stock_gui.py.
 
-Feat 5 — Notas por venta
--------------------------
-Campo de texto libre al cobrar, visible en historial de ventas.
-Requiere: schema v6 (columna 'notas' en tabla ventas).
+──────────────────────────────────────────────────────────────────────
+Error A — Líneas 2031-2032: "date" is not assignable to "bool"
+──────────────────────────────────────────────────────────────────────
+Causa: en _generar_reporte_pdf(), el dict `options` se construye con
+4 valores bool (Pylance infiere dict[str, bool]). Luego se asignan
+claves "desde" y "hasta" de tipo date → conflicto de tipos.
 
-Feat 8 — Comparación de períodos en reportes PDF
--------------------------------------------------
-En la sección de ventas del reporte, agregar columna comparativa con
-el período anterior equivalente.
-Requiere: segunda llamada a get_ventas_rango con fechas desplazadas.
+  # ANTES (línea 2017)
+  options = {
+      "productos": self._rep_productos_var.get(),   # bool
+      "ventas":    self._rep_ventas_var.get(),       # bool
+      "pendientes":self._rep_pendientes_var.get(),   # bool
+      "stock_bajo":self._rep_stock_bajo_var.get(),   # bool
+  }
+
+  # DESPUÉS — agregar anotación explícita
+  options: dict[str, Any] = {
+      "productos": self._rep_productos_var.get(),
+      "ventas":    self._rep_ventas_var.get(),
+      "pendientes":self._rep_pendientes_var.get(),
+      "stock_bajo":self._rep_stock_bajo_var.get(),
+  }
+
+`Any` ya está importado en la línea 9 del archivo.
+
+──────────────────────────────────────────────────────────────────────
+Errores B — Líneas 2591, 2592, 2606, 2609, 2610, 2615:
+           "cantidad"/"sale_date" is possibly unbound
+──────────────────────────────────────────────────────────────────────
+Causa: `cantidad` y `sale_date` se asignan dentro del bloque `try`.
+Pylance no puede inferir que en el handler de InsufficientStockError
+y en el código posterior, parse_int() ya tuvo que haber tenido éxito
+(porque si hubiera fallado con ValueError, habría entrado al último
+except y retornado). Desde el punto de vista estático, las variables
+podrían no estar asignadas.
+
+Estructura actual (simplificada):
+  try:
+      cantidad = parse_int(...)    # podría lanzar ValueError
+      sale_date = date.today()
+      total, sale_id = stock_app.register_sale(...)
+  except ProductNotFoundError:
+      return
+  except InsufficientStockError:
+      stock_app.register_sale(..., cantidad, ...)  # ← unbound?
+  except (ValueError, StockError):
+      return
+  # líneas 2603+: cantidad, sale_date usados ← unbound?
+
+Solución — separar la validación de entrada del intento de venta:
+
+  # DESPUÉS
+  try:
+      cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
+  except (ValueError, stock_app.StockError) as exc:
+      messagebox.showerror("No se pudo registrar", str(exc))
+      return
+
+  sale_date = date.today()   # aquí cantidad ya está garantizada
+
+  try:
+      total, sale_id = stock_app.register_sale(
+          self.conn, codigo, cantidad, sale_date=sale_date,
+          forma_pago=forma_pago,
+      )
+  except stock_app.ProductNotFoundError:
+      if messagebox.askyesno(...):
+          self._start_add_product_with_code(codigo)
+      return
+  except stock_app.InsufficientStockError as exc:
+      allow = messagebox.askyesno(...)
+      if not allow:
+          return
+      try:
+          total, sale_id = stock_app.register_sale(
+              self.conn, codigo, cantidad, allow_negative=True,
+              sale_date=sale_date, forma_pago=forma_pago,
+          )
+      except (ValueError, stock_app.StockError) as retry_exc:
+          logger.exception("Error en venta con stock negativo")
+          messagebox.showerror("No se pudo registrar", str(retry_exc))
+          return
+  except stock_app.StockError as exc:
+      logger.exception("Error registrando venta")
+      messagebox.showerror("No se pudo registrar", str(exc))
+      return
+
+Con esto, `cantidad` y `sale_date` están garantizados antes de entrar
+al try de la venta — Pylance ya no reporta unbound.
+
+──────────────────────────────────────────────────────────────────────
+Error C — Línea 3281: "Object of type 'object' is not callable"
+──────────────────────────────────────────────────────────────────────
+Causa: ConflictoDialog.__init__ tipea el parámetro on_complete
+como `object`, que no tiene __call__. Al hacer self._on_complete()
+en _finish(), Pylance lo rechaza.
+
+  # ANTES (línea 3027)
+  on_complete: object,
+
+  # DESPUÉS
+  on_complete: Callable[[], None],
+
+Agregar Callable al import de typing (línea 9):
+
+  # ANTES
+  from typing import Any
+
+  # DESPUÉS
+  from typing import Any, Callable
+
+──────────────────────────────────────────────────────────────────────
+Warning D — Línea 2044: Import "fpdf" could not be resolved
+──────────────────────────────────────────────────────────────────────
+Causa: fpdf2 no tiene stubs de tipos. El import es intencional (sirve
+para detectar si la librería está instalada antes de generar el PDF).
+
+  # ANTES (línea 2044)
+  import fpdf  # noqa: F401
+
+  # DESPUÉS
+  import fpdf  # type: ignore[import-untyped]  # noqa: F401
+
+Esto silencia el warning de Pylance sin cambiar el comportamiento.
+
+
+======================================================================
+ORDEN DE IMPLEMENTACIÓN
+======================================================================
+
+  0. Mejora 4 (errores Pylance) — correcciones de tipos, sin lógica
+     Empezar por aquí: son los cambios más seguros y rápidos.
+  1. Mejora 3 (ReportGenerator) — cambio acotado, sin tests que romper
+  2. Mejora 1 (refresh selectivo) — mayor impacto en UX, riesgo medio
+     Verificar manualmente que cada flujo actualiza las vistas correctas
+  3. Mejora 2 (StockService) — migración incremental
+     Empezar por las operaciones de escritura (vender, eliminar, agregar)
+     Dejar las lecturas simples para una segunda pasada
+
+
+======================================================================
+VERIFICACIÓN
+======================================================================
+
+Después de cada mejora:
+  python -m unittest test_stock_app -v
+  → Los 89 tests deben seguir pasando
+
+Flujos manuales a verificar para Mejora 1 (refresh selectivo):
+  - Registrar venta → tabla de productos actualiza stock
+  - Agregar producto → aparece en tabla sin reiniciar la app
+  - Aumento masivo de precios → tabla de precios actualiza si está visible
+  - Agregar pendiente → tabla de pendientes actualiza
+  - Dashboard refleja el estado correcto después de cada operación
+  - Undo/redo de venta → stock vuelve al valor anterior
+
+Flujos para Mejora 2 (StockService):
+  - Eliminar producto → undo → producto restaurado con proveedores
+  - Mismos flujos de venta, edición y precio
+
+Flujo para Mejora 3 (ReportGenerator):
+  - Cambiar nombre del negocio en configuración
+  - Generar PDF → el encabezado muestra el nombre nuevo (no el viejo)

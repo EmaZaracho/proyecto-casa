@@ -1,240 +1,331 @@
-# Sistema de Stock — Contexto del Proyecto
+# Sistema de Stock - Contexto del Proyecto
 
-Documento de referencia rápida: arquitectura, decisiones y estado actual.
+Documento de referencia rapida: arquitectura, decisiones y estado actual.
 
----
+## Que es
 
-## Qué es
-
-App de escritorio para gestión de inventario y punto de venta de un negocio pequeño. Corre localmente en Windows con Python + Tkinter + SQLite. Sin servidor, sin internet requerido.
-
----
+App de escritorio para gestion de inventario y punto de venta de un negocio pequeno. Corre localmente en Windows con Python, Tkinter y SQLite. Es una aplicacion monousuario, sin servidor y sin dependencia de internet para operar.
 
 ## Stack
 
-| Capa | Tecnología |
+| Capa | Tecnologia |
 |---|---|
 | GUI | Python 3.11 + Tkinter / ttk |
-| Datos | SQLite 3 vía `sqlite3` estándar |
-| PDF | `fpdf2` (instalado via pip) |
-| Tests | `unittest` estándar (79 tests) |
-| Entorno | Windows 11, ejecutable con `iniciar_gui.bat` |
+| Datos | SQLite 3 via `sqlite3` estandar |
+| PDF | `fpdf2` |
+| Tests | `unittest` estandar |
+| Entorno | Windows, ejecutable con `iniciar_gui.bat` |
 
----
+## Estado actual
+
+- Rama de trabajo: `prueba-de-refactorizacion`.
+- Schema actual: v5.
+- Tests actuales: 89 con `python -m unittest -v`.
+- `pytest` no esta instalado por defecto.
+- Textos visibles de la GUI normalizados a ASCII para evitar mojibake en Windows.
+- Refactor tecnico aplicado:
+  - `UndoManager` encapsula pilas de undo/redo.
+  - `StockService` encapsula operaciones de negocio sobre `self.conn`.
+  - `ReportGenerator` encapsula generacion de PDF.
+  - Refresh selectivo reemplaza `refresh_all()` en flujos de escritura.
+  - Variables Tkinter inicializadas en metodos privados.
+  - Logging subido a nivel `INFO`.
+  - Escrituras criticas en `stock_app.py` protegidas con `with conn:`.
 
 ## Archivos principales
 
+```text
+stock_app.py      - capa de datos: DB, migraciones, logica de negocio, CSV, backups
+stock_gui.py      - GUI Tkinter, flujos de usuario, undo/redo, reportes
+test_stock_app.py - tests de capa de datos, helpers y GUI
+iniciar_gui.bat   - lanzador de la app
+setup.bat         - crea entorno e instala dependencias
+build.bat         - empaqueta con PyInstaller
+stock.spec        - spec de PyInstaller
+requirements.txt  - dependencias Python
+config.json       - configuracion runtime, no versionada
+stock.db          - SQLite runtime, no versionado
+stock.log         - log runtime, no versionado
+backups/          - backups automaticos diarios, no versionados
 ```
-stock_app.py      — capa de datos: DB, lógica de negocio, funciones puras
-stock_gui.py      — GUI completa (Tkinter), consume stock_app
-test_stock_app.py — tests unitarios de la capa de datos
-iniciar_gui.bat   — lanzador de la app con manejo de errores
-setup.bat         — instala dependencias (.venv + requirements.txt)
-build.bat         — empaqueta con PyInstaller → dist/SistemaDeStock.exe
-stock.spec        — spec de PyInstaller
-requirements.txt  — dependencias (fpdf2)
-config.json       — configuración del negocio (generado en runtime, en .gitignore)
-stock.db          — base de datos SQLite (en .gitignore)
-stock.log         — log de errores (en .gitignore)
-backups/          — backups automáticos diarios del .db (en .gitignore)
-```
-
----
 
 ## Arquitectura
 
-### Separación de capas
+### Separacion de capas
 
-`stock_app.py` es la capa de datos: todas las operaciones de DB, sin Tkinter. La GUI en `stock_gui.py` llama a esas funciones y no hace SQL directamente. Esta separación permite testear la lógica sin levantar la interfaz.
+`stock_app.py` concentra la capa de datos y negocio. No importa Tkinter. Expone funciones para productos, ventas, caja, proveedores, pendientes, historial, CSV, PDF data y backups.
 
-### Base de datos
+`StockService` vive en `stock_app.py` y actua como fachada fina sobre esas funciones. Encapsula la conexion SQLite y evita que la GUI pase `self.conn` en cada operacion de escritura.
 
-Schema versioning con tabla `schema_version`. Al arrancar, `initialize_database()` detecta la versión actual y aplica migraciones pendientes. Las migraciones son idempotentes.
+`stock_gui.py` construye la interfaz Tkinter y usa `self._svc` para operaciones de negocio frecuentes. No deberia hacer SQL directo salvo casos puntuales que convenga migrar despues.
 
-**Versión actual: v5**
+### Clases estructurales nuevas
 
-| Migración | Cambio |
-|---|---|
-| v0 → v1 | Columnas extra en `productos`: proveedor, precio_costo, notas |
-| v1 → v2 | `forma_pago` en `ventas` |
-| v2 → v3 | `precio_costo` en `ventas` (para calcular ganancia bruta) |
-| v3 → v4 | Índices: `idx_ventas_fecha`, `idx_productos_nombre`, `idx_productos_proveedor` |
-| v4 → v5 | Tabla `proveedores_producto` + migración de datos existentes |
+`UndoManager` vive en `stock_gui.py` y encapsula:
 
-**Tablas:**
+- pila de undo
+- pila de redo
+- limite maximo de 10 acciones
+- invalidacion de redo cuando entra una accion nueva
+
+`ReportGenerator` vive en `stock_gui.py` y encapsula:
+
+- header de PDF
+- tabla generica
+- seccion productos
+- seccion ventas
+- seccion pendientes
+- seccion stock bajo
+- lectura fresca de `config.json` en cada `generate()`
+
+La GUI queda como wrapper: recoge opciones, pide archivo destino y delega en `ReportGenerator.generate()`.
+
+### Refresh selectivo
+
+`refresh_all()` queda para startup y el boton "Actualizar lista". Las operaciones de escritura usan helpers especificos:
+
+- `_refresh_after_sale()`
+- `_refresh_after_product_change()`
+- `_refresh_after_price_change()`
+- `_refresh_after_stock_change()`
+- `_refresh_after_supplier_change()`
+- `_refresh_after_pending_change()`
+- `_refresh_after_import()`
+
+Las pestañas caras (`Precios`, `Ventas`) solo se refrescan si estan visibles.
+
+## Base de datos
+
+### Conexion
+
+`get_connection()` configura:
 
 ```sql
-productos            — catálogo: codigo (PK), nombre, precio, stock, stock_minimo,
-                       proveedor, precio_costo, notas, foto (legada)
-ventas               — registros de venta: codigo, nombre, cantidad, precio_unit,
-                       total, fecha, hora, forma_pago, precio_costo
-caja                 — total diario por fecha (PK)
-historial_precios    — auditoría de cambios de precio (con motivo)
-pendientes           — lista de tareas interna
-schema_version       — versión actual del schema
-proveedores_producto — N proveedores por producto con precio_costo propio;
-                       es_principal=1 indica el activo
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
 ```
 
-### Dataclasses para importación
+Decisiones:
 
-`BoletaRow` — fila parseada de un CSV de boleta:
-- `codigo`, `nombre`, `cantidad` (requeridos)
-- `precio_costo`, `precio_venta`, `proveedor` (opcionales)
+- `foreign_keys=ON` es obligatorio para que `ON DELETE CASCADE` funcione en `proveedores_producto`.
+- `journal_mode=WAL` mejora el comportamiento de lectura/escritura local sin cambiar el modelo monousuario.
 
-`BoletaResult` — resultado de clasificar la boleta:
-- `rows_new` — productos nuevos (no existen en DB)
-- `rows_clean` — existentes sin conflicto de precio
-- `rows_conflict` — pares `(BoletaRow, db_row)` donde el precio difiere > 0.001
-- `skipped` — pares `(nro_línea, motivo)` de filas ignoradas
+### Versionado
 
-### Configuración persistente
+`initialize_database()` usa tabla `schema_version` y aplica migraciones idempotentes.
 
-`config.json` almacena `nombre_negocio` y `moneda`. Se lee en el header y en los PDFs. Funciones `load_config()` / `save_config()` en `stock_app.py`.
+Version actual: v5.
 
-### Logging
+| Migracion | Cambio |
+|---|---|
+| v0 -> v1 | columnas extra en `productos`: proveedor, precio_costo, notas |
+| v1 -> v2 | `forma_pago` en `ventas` |
+| v2 -> v3 | `precio_costo` en `ventas` |
+| v3 -> v4 | indices para ventas, nombre de producto y proveedor |
+| v4 -> v5 | tabla `proveedores_producto` y migracion de proveedor existente |
 
-Errores en `stock.log` con `logging.basicConfig` nivel ERROR. Los `except` críticos en la GUI llaman a `logger.exception()`.
+### Tablas
 
----
+```sql
+productos
+ventas
+caja
+historial_precios
+pendientes
+schema_version
+proveedores_producto
+```
+
+`productos.proveedor` y `productos.precio_costo` se mantienen como cache del proveedor principal para no romper consultas existentes. La fuente normalizada de proveedores es `proveedores_producto`.
+
+## Integridad y transacciones
+
+Las operaciones criticas de negocio usan `with conn:` para commit/rollback atomico:
+
+- `update_product`
+- `_restore_product`
+- `delete_product`
+- `adjust_stock`
+- `bulk_price_increase`
+- `add_pending`
+- `complete_pending`
+- `delete_pending`
+
+`log_price_change()` no hace commit propio. Se mantiene asi para que el cambio de precio y su auditoria queden en la misma transaccion.
+
+## Proveedores
+
+Decision actual: `get_all_proveedores()` lee desde `proveedores_producto`, no desde `productos.proveedor`.
+
+Motivo:
+
+- desde schema v5 los proveedores viven en la tabla normalizada;
+- leer solo `productos.proveedor` omite proveedores secundarios;
+- los combos de proveedor deben mostrar proveedores reales, no solo principales.
+
+Al crear o actualizar productos, si hay proveedor se crea o actualiza el proveedor principal en `proveedores_producto`, incluso si el costo es `0`.
+
+Si un producto se actualiza con proveedor vacio, se elimina el proveedor principal normalizado para evitar registros vacios en combos y listados. Si quedan proveedores secundarios, se promueve el primero como principal para que el producto no quede con proveedores pero sin principal.
+
+`add_product_supplier()` es idempotente por `codigo + proveedor`: si el proveedor ya existe para el producto, actualiza su costo y no crea una fila duplicada.
+
+Al borrar un producto:
+
+- SQLite borra sus proveedores por cascade;
+- la GUI captura `suppliers` antes de borrar;
+- `_restore_product()` puede reinsertar esos proveedores al deshacer;
+- si el codigo ya fue reutilizado, `_restore_product()` falla con `DuplicateProductError` y no mezcla proveedores del producto viejo con el nuevo.
+
+## Importacion de boletas
+
+La GUI pide el proveedor de la boleta antes de parsear el CSV. El usuario puede elegir un proveedor existente o ingresar uno nuevo.
+
+Formato minimo:
+
+```csv
+codigo,nombre,cantidad
+```
+
+Columnas opcionales:
+
+```csv
+precio_costo,precio_venta,proveedor
+```
+
+Decision actual: `proveedor` en el CSV es opcional. Si no viene o esta vacio, `parse_and_classify_boleta(..., default_proveedor=...)` usa el proveedor elegido en la GUI. Si la columna existe y una fila trae valor, ese valor tiene prioridad sobre el proveedor del dialogo.
 
 ## Funcionalidades implementadas
 
-### Pestaña Principal
+### Principal
 
-- **Tabla de productos**: búsqueda en tiempo real por código, nombre y proveedor (SQL `LIKE`). Ordenamiento por columna. Colores: rojo si stock ≤ 0, amarillo si stock < mínimo.
-- **Formulario de producto**: alta y edición inline. Campos: código, nombre, precio de venta, precio de costo, stock, mínimo, proveedor, notas.
-- **Multi-proveedor**: cada producto puede tener N proveedores con su propio precio_costo. Mini-tabla en el formulario para agregar, eliminar y cambiar el proveedor principal (`set_primary_supplier` actualiza `productos.proveedor` y `productos.precio_costo`).
-- **Ajustar stock**: diálogo para setear el stock directamente (`adjust_stock()`).
-- **Importar boleta CSV**: carga un archivo `codigo,nombre,cantidad,precio_costo,precio_venta,proveedor`. Los productos nuevos y los sin conflicto se aplican de inmediato. Los conflictos de precio abren `ConflictoDialog` para resolverlos 1 a 1 (ver más abajo).
-- **Venta rápida / carrito**: campo código + cantidad + forma de pago. Autocompletado por código. Búsqueda por nombre con 🔍. Carrito acumulativo con botón "Cobrar todo".
-- **Alertas de stock bajo**: tabla lateral con productos bajo el mínimo.
-- **Lista de tareas**: pendientes con toggle Pendiente/Completado.
+- Tabla de productos con busqueda en SQL.
+- Alta y edicion de productos.
+- Multi-proveedor por producto.
+- Ajuste directo de stock.
+- Importacion de boleta CSV con proveedor por dialogo.
+- Venta individual y carrito.
+- Alertas de stock bajo.
+- Pendientes internos.
 
-### ConflictoDialog (importación de boleta)
+### Gestion de precios
 
-Modal que aparece cuando la boleta trae un precio distinto al de la DB. Muestra los datos del producto y tres opciones por ítem:
-- **Mantener precio**: usa el precio actual de la DB (no lo pisa).
-- **Actualizar precio**: aplica el precio de la boleta.
-- **Modificar % de ganancia**: calcula precio de venta como `costo_boleta × (1 + pct/100)` con preview en tiempo real.
+- Tabla de productos con precio de venta, costo, margen y proveedor principal.
+- Filtros por texto y proveedor.
+- Aumento masivo con vista previa.
+- Undo de aumento masivo.
+- Exportacion de productos.
 
-Botón "Aplicar a todos los restantes igual" aplica la decisión actual a todos los conflictos pendientes de una vez.
+### Ventas del dia
 
-### Pestaña Gestión de Precios
+- Navegacion por fecha.
+- Filtro por rango `DD-MM-AAAA`.
+- Tabla de ventas.
+- Cierre de caja con desglose por pago, ganancia bruta y top productos.
+- Exportacion CSV.
 
-- Tabla con precio de venta, precio de costo, margen, proveedor.
-- Filtros: texto (SQL `LIKE`) + combo de proveedor.
-- Aumentos masivos por porcentaje, aplicables a seleccionados o a todos los filtrados.
-- Margen = `(precio - costo) / precio × 100` (sobre precio de venta, no markup).
-- Exportar CSV de productos. Exportar PDF con selector de contenido.
+### Historial de precios
 
-### Pestaña Ventas del Día
+- Auditoria automatica de cambios.
+- Motivos usados:
+  - `Edicion manual`
+  - `Aumento masivo X%`
+  - `Importacion boleta`
+- Busqueda SQL por codigo o nombre.
 
-- Navegación por fecha con botones ◀ ▶ y entrada manual. Botón "Hoy". Formato: **DD-MM-AAAA**.
-- Filtro por rango de fechas (Desde / Hasta). La comparación de rango se hace sobre objetos `date`, no strings.
-- Tabla con hora, código, nombre, cantidad, precio unitario, subtotal y forma de pago.
-- Resumen en header: N ventas | Total $X.
-- **Cierre de caja**: popup con total, desglose por forma de pago y top 5 productos más vendidos. Incluye ganancia bruta del día (schema v3+).
-- Exportar ventas a CSV.
+### Reportes
 
-### Pestaña Historial de Precios
+- PDF por secciones:
+  - productos
+  - ventas
+  - pendientes
+  - stock bajo
+- Implementado por `ReportGenerator`.
 
-- Registro automático en `historial_precios` con motivo:
-  - `"Edición manual"` — edición desde formulario
-  - `"Aumento masivo X%"` — desde Gestión de Precios
-  - `"Importación boleta"` — desde importación CSV
-- Búsqueda en tiempo real por código o nombre (SQL via `search_price_history()`).
+## Logging
 
-### Pestaña Reportes
+`stock_gui.py` configura logging a nivel `INFO` en `stock.log`.
 
-- Generación de PDF por secciones: lista de productos, ventas de rango, pendientes, stock bajo.
-- Rango de fechas configurable en formato DD-MM-AAAA (se convierte a ISO para la DB).
+Eventos de negocio registrados:
 
-### Funciones de sistema
+- venta individual
+- carrito procesado
+- producto eliminado
+- aumento masivo de precios
+- importacion de boleta
 
-- **Undo (Ctrl+Z)** y **Redo (Ctrl+Y)**, hasta 10 pasos. Tipos soportados: venta, eliminación de producto, aumento de precios, cambios en carrito.
-  - `_undo()` captura el estado antes de ejecutar y lo guarda en `_redo_stack`.
-  - `_redo()` re-aplica la acción y la remueve del stack. Una nueva acción vacía `_redo_stack`.
-  - Para ventas: `get_sale()` captura la fila antes de `reverse_sale()`; `restore_sale()` la re-inserta en redo.
-- **Backup automático**: un `.db` por día en `backups/`, al iniciar la app.
-- **Modo oscuro**: toggle en la barra superior.
-- **Configuración** (botón ⚙): nombre del negocio y símbolo de moneda.
-- **Atajos**: F1 → foco en código de venta; F2 → formulario de producto; F3 → tarea pendiente.
+Los errores criticos siguen usando `logger.exception()`.
 
----
+`load_config()` ya no silencia errores de lectura de `config.json`; registra warning y usa defaults.
+
+## Decisiones de diseno
+
+| Decision | Motivo |
+|---|---|
+| SQLite local, sin servidor | Instalacion simple para app monousuario. |
+| `foreign_keys=ON` por conexion | Hace efectivo `ON DELETE CASCADE`. |
+| `journal_mode=WAL` | Mejora robustez/performance local sin cambiar arquitectura. |
+| Mutaciones con `with conn:` | Rollback automatico ante fallos intermedios. |
+| `proveedores_producto` como fuente de proveedores | Evita perder proveedores secundarios. |
+| `productos.proveedor/precio_costo` como cache | Mantiene compatibilidad con vistas y reportes existentes. |
+| Proveedor vacio elimina proveedor principal y promueve secundario si existe | Evita registros vacios y mantiene un unico principal cuando quedan proveedores. |
+| Proveedor repetido actualiza costo sin duplicar | Hace idempotente la importacion de boletas y la carga manual. |
+| Undo de eliminacion captura proveedores | Necesario porque cascade borra `proveedores_producto`. |
+| Restore no usa `INSERT OR IGNORE` | Evita mezclar proveedores si un codigo eliminado fue reutilizado antes del undo. |
+| Proveedor de boleta por dialogo | Permite omitir `proveedor` en el CSV sin perder trazabilidad. |
+| `StockService` como fachada de negocio | Reduce acoplamiento entre GUI y funciones de `stock_app.py`. |
+| Refresh selectivo | Evita queries y reconstrucciones de Treeview no afectadas por la accion. |
+| `UndoManager` | Reduce responsabilidad directa de `StockGui`. |
+| `ReportGenerator` lee config al generar | Evita quedar atado a una referencia vieja del dict de config. |
+| Textos visibles ASCII | Evita mojibake en Tkinter/Windows con archivos tocados por distintas herramientas. |
+| `log_price_change()` sin commit propio | Auditoria y cambio quedan en la misma transaccion. |
+| Margen sobre precio de venta | Convencion actual del negocio. |
+| Fechas UI `DD-MM-AAAA`, DB ISO | UI amigable y DB ordenable. |
+| Carrito activo por defecto | Flujo habitual del negocio. |
 
 ## Funciones clave en stock_app.py
 
-| Función | Propósito |
+| Funcion | Proposito |
 |---|---|
-| `initialize_database()` | Crea tablas y aplica migraciones |
-| `get_connection()` | Devuelve conexión con `row_factory = sqlite3.Row` |
-| `add_product()` | Alta de producto, lanza `DuplicateProductError` si ya existe |
-| `update_product(..., motivo)` | Edita producto y loggea cambio de precio con motivo |
-| `delete_product()` / `restore_product()` | Baja y restauración para undo |
-| `adjust_stock()` | Setea stock directamente |
-| `register_sale()` | Registra venta, actualiza stock y caja, devuelve `(total, sale_id)` |
-| `reverse_sale(..., sale_id)` | Revierte venta por ID; fallback por campos si no hay ID |
-| `restore_sale()` | Re-inserta venta revertida (para redo) |
-| `get_sale()` | Lee una venta por ID antes de revertirla |
-| `bulk_price_increase()` | Aumento masivo, devuelve lista de `(codigo, old, new)` |
-| `restore_prices()` | Restaura precios anteriores (undo de aumento) |
-| `re_apply_prices()` | Re-aplica precios nuevos (redo de aumento) |
-| `get_product_suppliers()` | Lista proveedores de un producto, principal primero |
-| `add_product_supplier()` | Agrega proveedor (evita duplicados) |
-| `set_primary_supplier()` | Cambia principal y actualiza `productos.proveedor/precio_costo` |
-| `remove_product_supplier()` | Elimina proveedor (no el único) |
-| `parse_and_classify_boleta()` | Parsea CSV y clasifica filas en new/clean/conflict/skipped |
-| `apply_boleta_row()` | Aplica una fila de boleta con override de precio opcional |
-| `apply_boleta_batch()` | Aplica lista de filas, devuelve `(count_ok, errores)` |
-| `get_products_preview()` | Fetch de muestra de productos por código (sin SQL en GUI) |
-| `search_price_history()` | Historial de precios filtrado en SQL |
-| `get_ventas_rango()` | Ventas entre dos fechas ISO |
-| `get_range_summary()` | Resumen de rango (total, desglose por pago) |
-| `load_config()` / `save_config()` | Configuración del negocio en JSON |
-
----
-
-## Decisiones de diseño
-
-| Decisión | Motivo |
-|---|---|
-| SQLite local, sin servidor | App monousuario de escritorio. Simplicidad de instalación. |
-| `search_products()` en SQL | Más eficiente que traer todo y filtrar en Python. |
-| `_calc_margen()` como helper | Fórmula usada en 2 pestañas; centralizada para evitar divergencias. |
-| `log_price_change()` sin commit propio | Siempre se llama dentro de una transacción más grande. Intencional. |
-| `motivo` opcional en `update_product` | Backward-compatible; por defecto `"Edición manual"`. |
-| Margen = sobre precio de venta | Convención del negocio. No es markup (sobre costo). |
-| Carrito activo por defecto | El negocio siempre usa carrito. |
-| `forma_pago` DEFAULT 'Efectivo' | Retrocompatibilidad con ventas previas sin campo de pago. |
-| `proveedores_producto` separada | Relación N a N entre productos y proveedores sin romper el contrato de `register_sale()`. |
-| `_push_undo` limpia `_redo_stack` | Una nueva acción invalida el historial de redo (comportamiento estándar). |
-| `_redo` no llama `_push_undo` | Para no limpiar `_redo_stack` durante la misma operación de redo. |
-| Fechas en UI como DD-MM-AAAA | La DB siempre almacena ISO; la conversión ocurre en `_date_from_ui()` antes de cada query. `_ventas_filtrar_rango` compara objetos `date`, no strings, porque DD-MM-AAAA no es ordenable lexicográficamente. |
-| Boleta "keep": override explícito | Pasar `None` como override dejaría que `row.precio_venta` pisara el precio de DB. Se pasan los precios actuales de la DB explícitamente. |
-
----
+| `get_connection()` | Abre SQLite, row factory, WAL y foreign keys. |
+| `initialize_database()` | Crea tablas y aplica migraciones. |
+| `StockService` | Fachada para operaciones de negocio con una conexion SQLite. |
+| `add_product()` | Alta de producto y proveedor principal. |
+| `update_product(..., motivo)` | Edita producto, proveedor principal e historial de precio. |
+| `delete_product()` | Elimina producto; proveedores caen por cascade. |
+| `_restore_product()` | Reinsert para undo, incluyendo proveedores capturados. |
+| `register_sale()` | Venta, stock, caja y registro en `ventas`. |
+| `reverse_sale()` | Undo de venta. |
+| `restore_sale()` | Redo de venta. |
+| `bulk_price_increase()` | Aumento masivo transaccional. |
+| `restore_prices()` | Undo de aumento. |
+| `re_apply_prices()` | Redo de aumento. |
+| `get_all_proveedores()` | Lista proveedores desde `proveedores_producto`. |
+| `get_product_suppliers()` | Lista proveedores de un producto. |
+| `set_primary_supplier()` | Cambia proveedor principal y actualiza cache en `productos`. |
+| `parse_and_classify_boleta(..., default_proveedor)` | Lee CSV, aplica proveedor por defecto y clasifica filas. |
+| `apply_boleta_row()` | Aplica una fila de boleta. |
+| `apply_boleta_batch()` | Aplica lote de boleta. |
+| `get_range_summary()` | Resumen de ventas por rango. |
+| `load_config()` / `save_config()` | Configuracion runtime. |
 
 ## Tests
 
-`test_stock_app.py` — **79 tests** (36 `StockAppTests` + `StockGuiTests`). Cubre: alta de productos, ventas, stock, caja, reversiones, undo, precio histórico, ajuste de stock, multi-proveedor, aumento masivo.
-
-Los tests de GUI (`StockGuiTests`) requieren display y están marcados con `@unittest.skipUnless`.
+Comando principal:
 
 ```powershell
 python -m unittest -v
 ```
 
----
+Estado actual:
 
-## Pendientes / ideas registradas
+- 89 tests pasan.
+- Tests de GUI corren solo si hay display disponible.
+- Cobertura nueva incluye cascade de proveedores, restore sin merge accidental, proveedores duplicados, promocion de secundario y proveedor por defecto en boleta.
 
-- Tests de GUI no corren en CI (sin display).
-- El filtro por proveedor en la tabla de precios muestra solo el proveedor principal; podría extenderse a buscar en `proveedores_producto`.
-- Los tests de `date.today()` pueden ser frágiles cerca de la medianoche.
+## Pendientes / ideas
 
-**Feat 1 — Ticket post-venta:** popup con detalle itemizado después de cobrar (artículos, subtotales, total, forma de pago, fecha), con opción de imprimir o copiar como texto. No requiere cambio de schema.
-
-**Feat 5 — Notas por venta:** campo de texto libre opcional al cobrar, guardado en `ventas` y visible en el historial. Requiere schema v6 (columna `notas` en `ventas`).
-
-**Feat 8 — Comparación de períodos en reportes PDF:** en la sección de ventas del PDF, incluir fila comparativa con el período anterior equivalente. Solo requiere una segunda llamada a `get_ventas_rango` con fechas desplazadas.
+- El filtro por proveedor en la tabla de precios sigue mostrando el proveedor principal; podria extenderse para filtrar tambien por proveedores secundarios.
+- Tests dependientes de `date.today()` pueden ser fragiles cerca de medianoche.
+- Agregar ticket post-venta sin cambio de schema.
+- Agregar notas por venta con schema v6 (`ventas.notas`).
+- Comparacion de periodos en reportes PDF.

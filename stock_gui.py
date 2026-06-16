@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import sqlite3
@@ -6,7 +6,7 @@ import tkinter as tk
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any
+from typing import Any, Callable
 
 import stock_app
 
@@ -30,11 +30,240 @@ _COLORS_DARK = dict(
 
 logging.basicConfig(
     filename=stock_app.BASE_DIR / "stock.log",
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     encoding="utf-8",
 )
 logger = logging.getLogger(__name__)
+
+
+class UndoManager:
+    def __init__(self, max_size: int = _UNDO_MAX) -> None:
+        self._undo: list[dict[str, Any]] = []
+        self._redo: list[dict[str, Any]] = []
+        self._max = max_size
+
+    def push(self, action: dict[str, Any]) -> None:
+        self._undo.append(action)
+        if len(self._undo) > self._max:
+            self._undo.pop(0)
+        self._redo.clear()
+
+    def pop_undo(self) -> dict[str, Any] | None:
+        return self._undo.pop() if self._undo else None
+
+    def push_redo(self, action: dict[str, Any]) -> None:
+        self._redo.append(action)
+        if len(self._redo) > self._max:
+            self._redo.pop(0)
+
+    def push_undo_from_redo(self, action: dict[str, Any]) -> None:
+        self._undo.append(action)
+        if len(self._undo) > self._max:
+            self._undo.pop(0)
+
+    def pop_redo(self) -> dict[str, Any] | None:
+        return self._redo.pop() if self._redo else None
+
+    def clear_redo(self) -> None:
+        self._redo.clear()
+
+    @property
+    def next_undo_description(self) -> str | None:
+        return self._undo[-1].get("description") if self._undo else None
+
+    @property
+    def next_redo_description(self) -> str | None:
+        return self._redo[-1].get("description") if self._redo else None
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self._redo)
+
+
+class ReportGenerator:
+    """Genera PDFs de reporte a partir de datos del negocio."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    @staticmethod
+    def _moneda(config: dict) -> str:
+        return config.get("moneda", "$")
+
+    def generate(self, filepath: str, options: dict) -> None:
+        from fpdf import FPDF  # type: ignore[import-untyped]
+
+        config = stock_app.load_config()
+        moneda = self._moneda(config)
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        self._draw_header(pdf, config.get("nombre_negocio", "Reporte"))
+
+        if options.get("productos"):
+            self._section_productos(pdf, moneda)
+        if options.get("ventas"):
+            self._section_ventas(pdf, options["desde"], options["hasta"], moneda)
+        if options.get("pendientes"):
+            self._section_pendientes(pdf)
+        if options.get("stock_bajo"):
+            self._section_stock_bajo(pdf)
+
+        pdf.output(filepath)
+
+    def _draw_header(self, pdf, title: str) -> None:
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, title, ln=True, align="C")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+        pdf.ln(8)
+
+    def _section_title(self, pdf, title: str) -> None:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_fill_color(220, 220, 220)
+        pdf.cell(0, 8, title, ln=True, fill=True)
+        pdf.ln(2)
+
+    def _draw_table(self, pdf, headers, rows, col_widths) -> None:
+        pdf.set_font("Helvetica", "B", 8)
+        for header, width in zip(headers, col_widths):
+            pdf.cell(width, 7, header, border=1, align="C")
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 8)
+        for row in rows:
+            for text, width, align in row:
+                pdf.cell(width, 6, str(text), border=1, align=align)
+            pdf.ln()
+
+    def _section_productos(self, pdf, moneda: str) -> None:
+        productos = stock_app.list_products(self._conn)
+        self._section_title(pdf, f"Productos ({len(productos)})")
+        rows = []
+        for p in productos:
+            precio = float(p["precio"])
+            costo = float(p["precio_costo"])
+            rows.append([
+                (p["codigo"], 25, ""),
+                (str(p["nombre"])[:38], 65, ""),
+                (f"{moneda}{precio:.2f}", 25, "R"),
+                (f"{moneda}{costo:.2f}" if costo > 0 else "-", 25, "R"),
+                (p["stock"], 18, "C"),
+                (p["stock_minimo"], 18, "C"),
+                (str(p["proveedor"] or "-")[:8], 14, ""),
+            ])
+        self._draw_table(
+            pdf,
+            ["Codigo", "Nombre", "Precio", "Costo", "Stock", "Min.", "Proveedor"],
+            rows,
+            [25, 65, 25, 25, 18, 18, 14],
+        )
+        pdf.ln(6)
+
+    def _section_ventas(self, pdf, desde: date, hasta: date, moneda: str) -> None:
+        desde_iso = desde.isoformat()
+        hasta_iso = hasta.isoformat()
+        ventas = stock_app.get_ventas_rango(self._conn, desde_iso, hasta_iso)
+        resumen = stock_app.get_range_summary(self._conn, desde_iso, hasta_iso)
+        titulo = (
+            f"Ventas del {desde_iso}"
+            if desde_iso == hasta_iso
+            else f"Ventas del {desde_iso} al {hasta_iso}"
+        )
+        self._section_title(pdf, titulo)
+
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(60, 6, f"Total: {moneda}{resumen['total']:.2f}", border=0)
+        pdf.cell(60, 6, f"Transacciones: {resumen['count']}", border=0)
+        ganancia = resumen.get("ganancia_bruta", 0)
+        pdf.cell(0, 6, f"Ganancia bruta: {moneda}{ganancia:.2f}", ln=True, border=0)
+
+        if resumen["breakdown"]:
+            pdf.set_font("Helvetica", "", 8)
+            for row in resumen["breakdown"]:
+                pdf.cell(
+                    0,
+                    5,
+                    f"  {row['forma_pago']}: {row['cantidad']} ventas - "
+                    f"{moneda}{float(row['total']):.2f}",
+                    ln=True,
+                )
+        pdf.ln(3)
+
+        rows = []
+        for v in ventas:
+            rows.append([
+                (v["fecha"], 22, ""),
+                (str(v["hora"])[:5], 18, "C"),
+                (str(v["nombre"])[:42], 70, ""),
+                (v["cantidad"], 14, "C"),
+                (f"{moneda}{float(v['precio_unit']):.2f}", 24, "R"),
+                (f"{moneda}{float(v['total']):.2f}", 24, "R"),
+                (str(v["forma_pago"])[:10], 18, ""),
+            ])
+        self._draw_table(
+            pdf,
+            ["Fecha", "Hora", "Nombre", "Cant.", "P.Unit.", "Total", "Pago"],
+            rows,
+            [22, 18, 70, 14, 24, 24, 18],
+        )
+
+        if resumen["top_products"]:
+            pdf.ln(3)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(0, 6, "Top 5 productos mas vendidos:", ln=True)
+            pdf.set_font("Helvetica", "", 8)
+            for i, row in enumerate(resumen["top_products"], 1):
+                pdf.cell(
+                    0,
+                    5,
+                    f"  {i}. {row['nombre']} - {row['total_cant']} unid. - "
+                    f"{moneda}{float(row['total_monto']):.2f}",
+                    ln=True,
+                )
+        pdf.ln(6)
+
+    def _section_pendientes(self, pdf) -> None:
+        pendientes = stock_app.list_pending(self._conn)
+        self._section_title(pdf, f"Pendientes ({len(pendientes)})")
+        rows = [
+            [
+                (p["estado"], 30, "C"),
+                (str(p["descripcion"])[:65], 120, ""),
+                (str(p["creado_en"])[:16], 40, "C"),
+            ]
+            for p in pendientes
+        ]
+        self._draw_table(
+            pdf,
+            ["Estado", "Descripcion", "Creado"],
+            rows,
+            [30, 120, 40],
+        )
+        pdf.ln(6)
+
+    def _section_stock_bajo(self, pdf) -> None:
+        bajo = stock_app.low_stock_products(self._conn)
+        self._section_title(pdf, f"Stock bajo ({len(bajo)} productos)")
+        rows = [
+            [
+                (p["codigo"], 30, ""),
+                (str(p["nombre"])[:55], 100, ""),
+                (p["stock"], 30, "C"),
+                (p["stock_minimo"], 30, "C"),
+            ]
+            for p in bajo
+        ]
+        self._draw_table(
+            pdf,
+            ["Codigo", "Nombre", "Stock actual", "Stock min."],
+            rows,
+            [30, 100, 30, 30],
+        )
 
 
 class StockGui(tk.Tk):
@@ -46,70 +275,28 @@ class StockGui(tk.Tk):
 
         self.conn = stock_app.get_connection()
         stock_app.initialize_database(self.conn)
+        self._svc = stock_app.StockService(self.conn)
         self._config = stock_app.load_config()
         self._dark_mode: bool = bool(self._config.get("dark_mode", False))
         self._muted_labels: list[ttk.Label] = []
+        self._report_gen = ReportGenerator(self.conn)
+        self._init_product_vars()
+        self._init_sale_vars()
+        self._init_price_vars()
+        self._init_historial_vars()
+        self._init_ventas_vars()
 
-        # ── product form vars ──
-        self.codigo_var = tk.StringVar()
-        self.nombre_var = tk.StringVar()
-        self.precio_var = tk.StringVar()
-        self.precio_costo_var = tk.StringVar()
-        self.stock_var = tk.StringVar()
-        self.stock_minimo_var = tk.StringVar()
-        self.proveedor_var = tk.StringVar()
-        self.notas_var = tk.StringVar()
-
-        # ── sale vars ──
-        self.venta_codigo_var = tk.StringVar()
-        self.venta_cantidad_var = tk.StringVar(value="1")
-        self._venta_forma_pago_var = tk.StringVar(value="Efectivo")
-        self._producto_preview_var = tk.StringVar()
-
-        # ── other vars ──
-        self.pendiente_var = tk.StringVar()
-        self.caja_var = tk.StringVar()
-        self.search_var = tk.StringVar()
-        self._status_var = tk.StringVar()
-        self._ventas_summary_var = tk.StringVar(value="Hoy: 0 ventas | Total: $0.00")
-        self._cart_total_var = tk.StringVar(value="Total: $0.00")
-
-        # ── price tab vars ──
-        self.price_search_var = tk.StringVar()
-        self.price_proveedor_var = tk.StringVar()
-        self.aumento_var = tk.StringVar()
-        self._price_status_var = tk.StringVar(value="Seleccionados: 0")
-
-        # ── historial tab vars ──
-        self._hist_search_var = tk.StringVar()
-
-        # ── ventas tab vars ──
-        self._ventas_date_var = tk.StringVar(value=_date_to_ui(date.today()))
-        self._ventas_total_var = tk.StringVar(value="Total del día: $0.00")
-        self._ventas_desde_var = tk.StringVar(value="")
-        self._ventas_hasta_var = tk.StringVar(value="")
-        self._ventas_range_active = False
-
-        # ── reportes tab vars ──
-        self._rep_productos_var = tk.BooleanVar(value=True)
-        self._rep_ventas_var = tk.BooleanVar(value=True)
-        self._rep_pendientes_var = tk.BooleanVar(value=False)
-        self._rep_stock_bajo_var = tk.BooleanVar(value=True)
-        self._rep_desde_var = tk.StringVar(value=_date_to_ui(date.today().replace(day=1)))
-        self._rep_hasta_var = tk.StringVar(value=_date_to_ui(date.today()))
-
-        # ── sorting state ──
+        # â”€â”€ sorting state â”€â”€
         self._sort_col: str = ""
         self._sort_asc: bool = True
 
-        # ── state ──
+        # â”€â”€ state â”€â”€
         self._edit_mode = False
         self._edit_codigo: str | None = None
         self._form_visible = False
         self._cart_mode_active = False
         self._cart: list[dict[str, Any]] = []
-        self._undo_stack: list[dict[str, Any]] = []
-        self._redo_stack: list[dict[str, Any]] = []
+        self._undo_mgr = UndoManager()
 
         self._build_layout()
         self.search_var.trace_add("write", lambda *_: self.refresh_products())
@@ -126,9 +313,53 @@ class StockGui(tk.Tk):
 
         # silent daily backup
         try:
-            stock_app.backup_database()
+            self._svc.backup()
         except Exception:
             pass
+
+    def _init_product_vars(self) -> None:
+        self.codigo_var = tk.StringVar()
+        self.nombre_var = tk.StringVar()
+        self.precio_var = tk.StringVar()
+        self.precio_costo_var = tk.StringVar()
+        self.stock_var = tk.StringVar()
+        self.stock_minimo_var = tk.StringVar()
+        self.proveedor_var = tk.StringVar()
+        self.notas_var = tk.StringVar()
+
+    def _init_sale_vars(self) -> None:
+        self.venta_codigo_var = tk.StringVar()
+        self.venta_cantidad_var = tk.StringVar(value="1")
+        self._venta_forma_pago_var = tk.StringVar(value="Efectivo")
+        self._producto_preview_var = tk.StringVar()
+        self.pendiente_var = tk.StringVar()
+        self.caja_var = tk.StringVar()
+        self.search_var = tk.StringVar()
+        self._status_var = tk.StringVar()
+        self._ventas_summary_var = tk.StringVar(value="Hoy: 0 ventas | Total: $0.00")
+        self._cart_total_var = tk.StringVar(value="Total: $0.00")
+
+    def _init_price_vars(self) -> None:
+        self.price_search_var = tk.StringVar()
+        self.price_proveedor_var = tk.StringVar()
+        self.aumento_var = tk.StringVar()
+        self._price_status_var = tk.StringVar(value="Seleccionados: 0")
+
+    def _init_historial_vars(self) -> None:
+        self._hist_search_var = tk.StringVar()
+
+    def _init_ventas_vars(self) -> None:
+        self._ventas_date_var = tk.StringVar(value=_date_to_ui(date.today()))
+        self._ventas_total_var = tk.StringVar(value="Total del dia: $0.00")
+        self._ventas_desde_var = tk.StringVar(value="")
+        self._ventas_hasta_var = tk.StringVar(value="")
+        self._ventas_range_active = False
+        self._rep_productos_var = tk.BooleanVar(value=True)
+        self._rep_ventas_var = tk.BooleanVar(value=True)
+        self._rep_pendientes_var = tk.BooleanVar(value=False)
+        self._rep_stock_bajo_var = tk.BooleanVar(value=True)
+        self._rep_desde_var = tk.StringVar(value=_date_to_ui(date.today().replace(day=1)))
+        self._rep_hasta_var = tk.StringVar(value=_date_to_ui(date.today()))
 
     # =========================================================================
     # Layout
@@ -154,19 +385,19 @@ class StockGui(tk.Tk):
         )
         self._title_label.grid(row=0, column=0, sticky="w")
         ttk.Label(hdr, textvariable=self.caja_var).grid(row=0, column=1, sticky="e", padx=(0, 10))
-        ttk.Button(hdr, text="⚙", width=3, command=self._show_configuracion).grid(
+        ttk.Button(hdr, text="Config", width=7, command=self._show_configuracion).grid(
             row=0, column=2, padx=(0, 6)
         )
         self._undo_btn = ttk.Button(
-            hdr, text="↩ Deshacer (Ctrl+Z)", command=self._undo, state="disabled"
+            hdr, text="Deshacer (Ctrl+Z)", command=self._undo, state="disabled"
         )
         self._undo_btn.grid(row=0, column=3, padx=(6, 0))
         self._redo_btn = ttk.Button(
-            hdr, text="↪ Rehacer (Ctrl+Y)", command=self._redo, state="disabled"
+            hdr, text="Rehacer (Ctrl+Y)", command=self._redo, state="disabled"
         )
         self._redo_btn.grid(row=0, column=4, padx=(6, 0))
         self._dark_mode_btn = ttk.Button(
-            hdr, text="🌙" if not self._dark_mode else "☀", width=3,
+            hdr, text="Oscuro" if not self._dark_mode else "Claro", width=7,
             command=self._toggle_dark_mode,
         )
         self._dark_mode_btn.grid(row=0, column=5, padx=(6, 0))
@@ -190,8 +421,8 @@ class StockGui(tk.Tk):
         tab5 = ttk.Frame(self._notebook, padding=6)
         self._notebook.add(tab0, text="  Resumen  ")
         self._notebook.add(tab1, text="  Principal  ")
-        self._notebook.add(tab2, text="  Gestión de precios  ")
-        self._notebook.add(tab3, text="  Ventas del día  ")
+        self._notebook.add(tab2, text="  Gestion de precios  ")
+        self._notebook.add(tab3, text="  Ventas del dia  ")
         self._notebook.add(tab4, text="  Historial de precios  ")
         self._notebook.add(tab5, text="  Reportes  ")
 
@@ -210,7 +441,7 @@ class StockGui(tk.Tk):
 
         self._apply_theme()
 
-    # ── Tab 0 — Dashboard ─────────────────────────────────────────────────────
+    # â”€â”€ Tab 0 â€” Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_dashboard(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(0, weight=1)
@@ -236,7 +467,7 @@ class StockGui(tk.Tk):
         stock_lf.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         stock_lf.columnconfigure(0, weight=1)
 
-        self._dash_alert_var = tk.StringVar(value="✅ Sin alertas")
+        self._dash_alert_var = tk.StringVar(value="Sin alertas")
         ttk.Label(stock_lf, textvariable=self._dash_alert_var).grid(
             row=0, column=0, sticky="w", pady=(0, 6)
         )
@@ -248,7 +479,7 @@ class StockGui(tk.Tk):
             height=6,
             selectmode="none",
         )
-        self._dash_stock_list.heading("codigo", text="Código", anchor="center")
+        self._dash_stock_list.heading("codigo", text="Codigo", anchor="center")
         self._dash_stock_list.heading("nombre", text="Nombre", anchor="center")
         self._dash_stock_list.heading("stock", text="Stock", anchor="center")
         self._dash_stock_list.column("codigo", width=110, anchor="center")
@@ -256,26 +487,26 @@ class StockGui(tk.Tk):
         self._dash_stock_list.column("stock", width=70, anchor="center")
         self._dash_stock_list.grid(row=1, column=0, sticky="ew")
 
-        # Acceso rápido
-        quick_lf = ttk.LabelFrame(frame, text="  Acceso rápido  ", padding=10)
+        # Acceso rÃ¡pido
+        quick_lf = ttk.LabelFrame(frame, text="  Acceso rapido  ", padding=10)
         quick_lf.grid(row=2, column=0, sticky="ew")
 
         ttk.Button(
-            quick_lf, text="🧾 Nueva venta  (F1)",
+            quick_lf, text="Nueva venta  (F1)",
             command=lambda: (
                 self._notebook.select(1),
                 self.after(50, self._venta_codigo_entry.focus_set),
             ),
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
-            quick_lf, text="🔍 Buscar producto",
+            quick_lf, text="Buscar producto",
             command=lambda: (
                 self._notebook.select(1),
                 self.after(50, self._product_search_entry.focus_set),
             ),
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
-            quick_lf, text="📦 Nuevo producto  (F2)",
+            quick_lf, text="Nuevo producto  (F2)",
             command=lambda: (
                 self._notebook.select(1),
                 self.after(80, self._toggle_form),
@@ -283,8 +514,8 @@ class StockGui(tk.Tk):
         ).pack(side="left")
 
     def _refresh_dashboard(self) -> None:
-        summary = stock_app.get_daily_summary(self.conn)
-        breakdown = stock_app.get_payment_breakdown(self.conn)
+        summary = self._svc.resumen_diario()
+        breakdown = self._svc.desglose_pagos()
 
         self._dash_total_var.set(f"${summary['total']:.2f}")
         count = summary["count"]
@@ -297,16 +528,16 @@ class StockGui(tk.Tk):
         else:
             self._dash_pagos_var.set("Sin ventas registradas")
 
-        productos = stock_app.search_products(self.conn)
+        productos = self._svc.buscar_productos()
         criticos = [p for p in productos if p["stock"] <= 0]
         bajos = [p for p in productos if 0 < p["stock"] < p["stock_minimo"]]
 
         if criticos or bajos:
             self._dash_alert_var.set(
-                f"🔴 {len(criticos)} sin stock   |   🟡 {len(bajos)} bajo mínimo"
+                f"{len(criticos)} sin stock   |   {len(bajos)} bajo minimo"
             )
         else:
-            self._dash_alert_var.set("✅ Sin alertas de stock")
+            self._dash_alert_var.set("Sin alertas de stock")
 
         clear_table(self._dash_stock_list)
         for p in (criticos + bajos)[:10]:
@@ -315,7 +546,7 @@ class StockGui(tk.Tk):
                 values=(p["codigo"], p["nombre"], p["stock"]),
             )
 
-    # ── Tab 1 ─────────────────────────────────────────────────────────────────
+    # â”€â”€ Tab 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_principal(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=2)
@@ -336,7 +567,7 @@ class StockGui(tk.Tk):
         toggle_row = ttk.Frame(left)
         toggle_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         self._toggle_form_btn = ttk.Button(
-            toggle_row, text="＋ Nuevo producto", command=self._toggle_form
+            toggle_row, text="+ Nuevo producto", command=self._toggle_form
         )
         self._toggle_form_btn.pack(side="left")
         ttk.Button(
@@ -356,14 +587,14 @@ class StockGui(tk.Tk):
         for col in range(8):
             self._product_form_frame.columnconfigure(col, weight=1)
 
-        # row 0 — labels
+        # row 0 â€” labels
         for col, text in enumerate(
             ("Codigo", "Nombre", "", "Precio", "P.Costo", "Stock", "Minimo", "Proveedor")
         ):
             if text:
                 ttk.Label(self._product_form_frame, text=text).grid(row=0, column=col, sticky="w")
 
-        # row 1 — entries
+        # row 1 â€” entries
         self._codigo_entry = ttk.Entry(self._product_form_frame, textvariable=self.codigo_var)
         self._codigo_entry.grid(row=1, column=0, sticky="ew", padx=(0, 4))
 
@@ -389,12 +620,12 @@ class StockGui(tk.Tk):
         self._proveedor_combo.bind("<ButtonPress>", lambda _: self._refresh_form_proveedor())
         self._proveedor_combo.bind("<FocusIn>", lambda _: self._refresh_form_proveedor())
 
-        # row 2 — second row labels
+        # row 2 â€” second row labels
         ttk.Label(self._product_form_frame, text="Notas").grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
 
-        # row 3 — notas + actions
+        # row 3 â€” notas + actions
         ttk.Entry(self._product_form_frame, textvariable=self.notas_var).grid(
             row=3, column=0, columnspan=6, sticky="ew", padx=(0, 4)
         )
@@ -467,7 +698,7 @@ class StockGui(tk.Tk):
             ("precio", "Precio", 80),
             ("margen", "Margen", 70),
             ("stock", "Stock", 60),
-            ("minimo", "Stock mín.", 70),
+            ("minimo", "Stock min.", 70),
             ("proveedor", "Proveedor", 110),
         ):
             self.products_table.heading(
@@ -524,7 +755,7 @@ class StockGui(tk.Tk):
         code_row.columnconfigure(0, weight=1)
         self._venta_codigo_entry = ttk.Entry(code_row, textvariable=self.venta_codigo_var)
         self._venta_codigo_entry.grid(row=0, column=0, sticky="ew")
-        ttk.Button(code_row, text="🔍", width=3, command=self._buscar_producto_por_nombre).grid(
+        ttk.Button(code_row, text="Buscar", width=7, command=self._buscar_producto_por_nombre).grid(
             row=0, column=1, padx=(4, 0)
         )
 
@@ -557,7 +788,7 @@ class StockGui(tk.Tk):
         # cart mode: add-to-cart button (hidden by default)
         # cart mode: add-to-cart button (hidden by default)
         self._agregar_carrito_btn = ttk.Button(
-            frame, text="＋ Agregar al carrito", command=self._add_to_cart
+            frame, text="+ Agregar al carrito", command=self._add_to_cart
         )
         self._agregar_carrito_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._agregar_carrito_btn.grid_remove()
@@ -601,7 +832,7 @@ class StockGui(tk.Tk):
         self._cart_btns_frame = cart_btns
 
         self._toggle_cart_btn = ttk.Button(
-            frame, text="🛒 Activar modo carrito", command=self._toggle_cart_mode
+            frame, text="Activar modo carrito", command=self._toggle_cart_mode
         )
         self._toggle_cart_btn.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
@@ -621,7 +852,7 @@ class StockGui(tk.Tk):
             ("codigo", "Codigo", 82),
             ("nombre", "Nombre", 115),
             ("stock", "Stock", 52),
-            ("minimo", "Stock mín.", 60),
+            ("minimo", "Stock min.", 60),
         ):
             self.alerts_table.heading(col, text=label)
             self.alerts_table.column(col, width=width, minwidth=40)
@@ -661,7 +892,7 @@ class StockGui(tk.Tk):
         )
         ttk.Button(btn_row, text="Refrescar", command=self.refresh_pending).grid(row=0, column=3)
 
-    # ── Tab 2: price management ───────────────────────────────────────────────
+    # â”€â”€ Tab 2: price management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_precios(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -693,7 +924,7 @@ class StockGui(tk.Tk):
 
         table_frame = ttk.LabelFrame(
             parent,
-            text="Productos  —  Ctrl+Click o Shift+Click para seleccion multiple",
+            text="Productos - Ctrl+Click o Shift+Click para seleccion multiple",
             padding=8,
         )
         table_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
@@ -745,7 +976,7 @@ class StockGui(tk.Tk):
         ).grid(row=0, column=5, padx=(0, 8))
         ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=6, sticky="e")
 
-    # ── Tab 4: price history ──────────────────────────────────────────────────
+    # â”€â”€ Tab 4: price history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_historial(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -787,7 +1018,7 @@ class StockGui(tk.Tk):
     def _refresh_price_history(self) -> None:
         clear_table(self._hist_table)
         query = self._hist_search_var.get()
-        for row in stock_app.search_price_history(self.conn, query):
+        for row in self._svc.historial_precios(query):
             ant = float(row["precio_anterior"])
             nvo = float(row["precio_nuevo"])
             if ant > 0:
@@ -800,22 +1031,22 @@ class StockGui(tk.Tk):
                 f"${ant:.2f}", f"${nvo:.2f}", cambio, row["motivo"],
             ))
 
-    # ── Tab 3: sales of the day ───────────────────────────────────────────────
+    # â”€â”€ Tab 3: sales of the day â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_ventas(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        # ── date navigation + summary ─────────────────────────────────────────
+        # â”€â”€ date navigation + summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         nav_frame = ttk.Frame(parent)
         nav_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         nav_frame.columnconfigure(4, weight=1)
 
-        self._nav_prev_btn = ttk.Button(nav_frame, text="◀", width=3, command=self._ventas_prev_day)
+        self._nav_prev_btn = ttk.Button(nav_frame, text="<", width=3, command=self._ventas_prev_day)
         self._nav_prev_btn.grid(row=0, column=0, padx=(0, 2))
         self._nav_date_entry = ttk.Entry(nav_frame, textvariable=self._ventas_date_var, width=12)
         self._nav_date_entry.grid(row=0, column=1, padx=(0, 2))
-        self._nav_next_btn = ttk.Button(nav_frame, text="▶", width=3, command=self._ventas_next_day)
+        self._nav_next_btn = ttk.Button(nav_frame, text=">", width=3, command=self._ventas_next_day)
         self._nav_next_btn.grid(row=0, column=2, padx=(0, 10))
         self._nav_today_btn = ttk.Button(nav_frame, text="Hoy", command=self._ventas_go_today)
         self._nav_today_btn.grid(row=0, column=3, padx=(0, 14))
@@ -824,10 +1055,10 @@ class StockGui(tk.Tk):
             font=("Segoe UI", 11, "bold"),
         ).grid(row=0, column=4, sticky="e")
 
-        # ── date range filter ─────────────────────────────────────────────────
+        # â”€â”€ date range filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         range_frame = ttk.Frame(parent)
         range_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(range_frame, text="Rango — Desde:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Label(range_frame, text="Rango - Desde:").grid(row=0, column=0, padx=(0, 4))
         ttk.Entry(range_frame, textvariable=self._ventas_desde_var, width=12).grid(
             row=0, column=1, padx=(0, 8)
         )
@@ -842,7 +1073,7 @@ class StockGui(tk.Tk):
             row=0, column=5
         )
 
-        # ── ventas table ─────────────────────────────────────────────────────
+        # â”€â”€ ventas table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._ventas_table_frame = ttk.LabelFrame(parent, text="Ventas", padding=8)
         self._ventas_table_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
         self._ventas_table_frame.rowconfigure(0, weight=1)
@@ -868,13 +1099,13 @@ class StockGui(tk.Tk):
         self.ventas_table.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
 
-        # ── total footer ──────────────────────────────────────────────────────
+        # â”€â”€ total footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ttk.Label(parent, textvariable=self._ventas_total_var,
                   font=("Segoe UI", 10, "bold")).grid(
             row=3, column=0, sticky="e", pady=(0, 4)
         )
 
-        # ── buttons ───────────────────────────────────────────────────────────
+        # â”€â”€ buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         btn_row = ttk.Frame(parent)
         btn_row.grid(row=4, column=0, sticky="ew")
         btn_row.columnconfigure(0, weight=1)
@@ -904,10 +1135,10 @@ class StockGui(tk.Tk):
         self._form_visible = not self._form_visible
         if self._form_visible:
             self._product_form_frame.grid()
-            self._toggle_form_btn.configure(text="✕ Cerrar formulario")
+            self._toggle_form_btn.configure(text="Cerrar formulario")
         else:
             self._product_form_frame.grid_remove()
-            self._toggle_form_btn.configure(text="＋ Nuevo producto")
+            self._toggle_form_btn.configure(text="+ Nuevo producto")
 
     # =========================================================================
     # Tab change
@@ -978,10 +1209,10 @@ class StockGui(tk.Tk):
             self._producto_preview_var.set("")
             return
         try:
-            row = stock_app.get_product(self.conn, codigo)
+            row = self._svc.obtener_producto(codigo)
             if row:
                 self._producto_preview_var.set(
-                    f"{row['nombre']}  —  ${float(row['precio']):.2f}  |  Stock: {row['stock']}"
+                    f"{row['nombre']}  -  ${float(row['precio']):.2f}  |  Stock: {row['stock']}"
                 )
             else:
                 self._producto_preview_var.set("")
@@ -997,7 +1228,7 @@ class StockGui(tk.Tk):
         dialog.transient(self)
         dialog.grab_set()
 
-        ttk.Label(dialog, text="Buscar por nombre o código:").pack(padx=12, pady=(12, 4), anchor="w")
+        ttk.Label(dialog, text="Buscar por nombre o codigo:").pack(padx=12, pady=(12, 4), anchor="w")
 
         search_var = tk.StringVar(value=query)
         search_entry = ttk.Entry(dialog, textvariable=search_var)
@@ -1012,9 +1243,9 @@ class StockGui(tk.Tk):
             listbox.delete(0, "end")
             _all_products.clear()
             q = q.lower()
-            for p in stock_app.list_products(self.conn):
+            for p in self._svc.listar_productos():
                 if not q or q in p["codigo"].lower() or q in p["nombre"].lower():
-                    display = f"{p['codigo']}  —  {p['nombre']}  (${float(p['precio']):.2f})"
+                    display = f"{p['codigo']}  -  {p['nombre']}  (${float(p['precio']):.2f})"
                     listbox.insert("end", display)
                     _all_products.append(p["codigo"])
 
@@ -1048,12 +1279,12 @@ class StockGui(tk.Tk):
         self.refresh_products()
 
     # =========================================================================
-    # Configuración del negocio
+    # Configuracion del negocio
     # =========================================================================
 
     def _show_configuracion(self) -> None:
         dialog = tk.Toplevel(self)
-        dialog.title("Configuración")
+        dialog.title("Configuracion")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
@@ -1065,7 +1296,7 @@ class StockGui(tk.Tk):
         nombre_var = tk.StringVar(value=self._config.get("nombre_negocio", ""))
         ttk.Entry(frame, textvariable=nombre_var, width=32).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(frame, text="Símbolo de moneda:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="Simbolo de moneda:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         moneda_var = tk.StringVar(value=self._config.get("moneda", "$"))
         ttk.Entry(frame, textvariable=moneda_var, width=6).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
@@ -1078,7 +1309,7 @@ class StockGui(tk.Tk):
             stock_app.save_config(self._config)
             self._title_label.configure(text=self._config["nombre_negocio"])
             dialog.destroy()
-            self._set_status("✓ Configuración guardada")
+            self._set_status("Configuracion guardada")
 
         ttk.Button(btn_frame, text="Guardar", command=_guardar).pack(side="right", padx=(8, 0))
         ttk.Button(btn_frame, text="Cancelar", command=dialog.destroy).pack(side="right")
@@ -1089,10 +1320,10 @@ class StockGui(tk.Tk):
     # =========================================================================
 
     def _refresh_form_proveedor(self) -> None:
-        self._proveedor_combo["values"] = stock_app.get_all_proveedores(self.conn)
+        self._proveedor_combo["values"] = self._svc.todos_los_proveedores()
 
     def _refresh_price_proveedor(self) -> None:
-        self._price_proveedor_combo["values"] = stock_app.get_all_proveedores(self.conn)
+        self._price_proveedor_combo["values"] = self._svc.todos_los_proveedores()
 
     def _set_supplier_controls_state(self, state: str) -> None:
         for btn in (
@@ -1108,7 +1339,7 @@ class StockGui(tk.Tk):
             self._set_supplier_controls_state("disabled")
             return
         self._set_supplier_controls_state("normal")
-        for row in stock_app.get_product_suppliers(self.conn, self._edit_codigo):
+        for row in self._svc.proveedores_producto(self._edit_codigo):
             self._suppliers_table.insert(
                 "",
                 "end",
@@ -1123,7 +1354,7 @@ class StockGui(tk.Tk):
     def _sync_primary_supplier_fields(self) -> None:
         if not self._edit_codigo:
             return
-        product = stock_app.get_product(self.conn, self._edit_codigo)
+        product = self._svc.obtener_producto(self._edit_codigo)
         self.proveedor_var.set(product["proveedor"] or "")
         self.precio_costo_var.set(str(product["precio_costo"]))
 
@@ -1147,14 +1378,14 @@ class StockGui(tk.Tk):
             return
         try:
             precio_costo = parse_float(costo_raw, "precio costo")
-            stock_app.add_product_supplier(self.conn, self._edit_codigo, proveedor, precio_costo)
+            self._svc.agregar_proveedor_producto(self._edit_codigo, proveedor, precio_costo)
         except (ValueError, stock_app.StockError) as exc:
             messagebox.showerror("No se pudo agregar", str(exc))
             return
         self._sync_primary_supplier_fields()
         self._refresh_product_suppliers()
         self.refresh_products()
-        self.refresh_price_table()
+        self._refresh_visible_tabs()
         self._set_status(f"Proveedor '{proveedor}' agregado.")
 
     def _selected_supplier_id(self) -> int | None:
@@ -1171,13 +1402,13 @@ class StockGui(tk.Tk):
         if supplier_id is None:
             return
         try:
-            stock_app.set_primary_supplier(self.conn, supplier_id, self._edit_codigo)
+            self._svc.establecer_proveedor_principal(supplier_id, self._edit_codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("No se pudo actualizar", str(exc))
             return
         self._sync_primary_supplier_fields()
         self._refresh_product_suppliers()
-        self.refresh_all()
+        self._refresh_after_supplier_change()
         self._set_status("Proveedor principal actualizado.")
 
     def _remove_product_supplier(self) -> None:
@@ -1187,12 +1418,12 @@ class StockGui(tk.Tk):
         if not messagebox.askyesno("Eliminar proveedor", "Eliminar el proveedor seleccionado?"):
             return
         try:
-            stock_app.remove_product_supplier(self.conn, supplier_id)
+            self._svc.quitar_proveedor_producto(supplier_id)
         except stock_app.StockError as exc:
             messagebox.showerror("No se pudo eliminar", str(exc))
             return
         self._refresh_product_suppliers()
-        self.refresh_all()
+        self._refresh_after_supplier_change()
         self._set_status("Proveedor eliminado.")
 
     def _clear_price_filters(self) -> None:
@@ -1217,14 +1448,14 @@ class StockGui(tk.Tk):
             self._cart_table.grid()
             self._cart_total_label.grid()
             self._cart_btns_frame.grid()
-            self._toggle_cart_btn.configure(text="✕ Desactivar modo carrito")
+            self._toggle_cart_btn.configure(text="Desactivar modo carrito")
         else:
             self._agregar_carrito_btn.grid_remove()
             self._cart_table.grid_remove()
             self._cart_total_label.grid_remove()
             self._cart_btns_frame.grid_remove()
             self._registrar_btn.grid()
-            self._toggle_cart_btn.configure(text="🛒 Activar modo carrito")
+            self._toggle_cart_btn.configure(text="Activar modo carrito")
             self._clear_cart()
 
     def _handle_venta_return(self) -> None:
@@ -1243,11 +1474,11 @@ class StockGui(tk.Tk):
             messagebox.showerror("Valor invalido", str(exc))
             return
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.ProductNotFoundError:
             if messagebox.askyesno(
                 "Producto no encontrado",
-                f"No existe ningún producto con código '{codigo}'.\n\n¿Querés agregarlo ahora?",
+                f"No existe ningun producto con codigo '{codigo}'.\n\nQueres agregarlo ahora?",
             ):
                 self._start_add_product_with_code(codigo)
             return
@@ -1329,7 +1560,7 @@ class StockGui(tk.Tk):
         ttk.Label(frame, text="Producto:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
         ttk.Label(frame, text=item["nombre"]).grid(row=0, column=1, sticky="w", pady=(0, 6))
 
-        ttk.Label(frame, text="Código:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(frame, text="Codigo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
         ttk.Label(frame, text=item["codigo"]).grid(row=1, column=1, sticky="w", pady=(0, 6))
 
         qty_var = tk.StringVar(value=str(item["cantidad"]))
@@ -1427,7 +1658,7 @@ class StockGui(tk.Tk):
 
     def _cobrar_carrito(self) -> None:
         if not self._cart:
-            messagebox.showerror("Carrito vacío", "No hay productos en el carrito.")
+            messagebox.showerror("Carrito vacio", "No hay productos en el carrito.")
             return
 
         forma_pago = self._venta_forma_pago_var.get() or "Efectivo"
@@ -1437,8 +1668,8 @@ class StockGui(tk.Tk):
 
         for item in self._cart:
             try:
-                total, sale_id = stock_app.register_sale(
-                    self.conn, item["codigo"], item["cantidad"],
+                total, sale_id = self._svc.vender(
+                    item["codigo"], item["cantidad"],
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
                 processed.append({
@@ -1448,9 +1679,9 @@ class StockGui(tk.Tk):
                     "sale_date": sale_date.isoformat(),
                 })
             except stock_app.InsufficientStockError as exc:
-                errors.append(f"• {item['nombre']}: {exc}")
+                errors.append(f"- {item['nombre']}: {exc}")
             except stock_app.StockError as exc:
-                errors.append(f"• {item['nombre']}: {exc}")
+                errors.append(f"- {item['nombre']}: {exc}")
 
         for item in reversed(processed):
             self._push_undo({
@@ -1466,9 +1697,12 @@ class StockGui(tk.Tk):
         processed_codes = {p["codigo"] for p in processed}
         self._cart = [i for i in self._cart if i["codigo"] not in processed_codes]
         self._refresh_cart_display()
-        self.refresh_all()
+        if processed:
+            self._refresh_after_sale()
 
         total_cobrado = sum(p["total"] for p in processed)
+        if processed:
+            logger.info("Carrito procesado: %d items, total $%.2f", len(processed), total_cobrado)
         if errors:
             messagebox.showwarning(
                 "Venta parcial",
@@ -1477,7 +1711,7 @@ class StockGui(tk.Tk):
             )
         else:
             self._set_status(
-                f"✓ Carrito cobrado [{forma_pago}] — {len(processed)} prod. — Total: ${total_cobrado:.2f}"
+                f"Carrito cobrado [{forma_pago}] - {len(processed)} prod. - Total: ${total_cobrado:.2f}"
             )
             self._cart.clear()
             self._refresh_cart_display()
@@ -1517,7 +1751,7 @@ class StockGui(tk.Tk):
             messagebox.showerror("Valor invalido", "El porcentaje debe ser mayor a 0.")
             return
 
-        sample_rows = stock_app.get_products_preview(self.conn, codigos[:3])
+        sample_rows = self._svc.vista_previa_productos(codigos[:3])
         preview_lines = "\n".join(
             f"  {row['nombre'][:25]}: ${row['precio']:.0f} -> "
             f"${round(row['precio'] * (1 + pct / 100) / 10) * 10:.0f}"
@@ -1532,16 +1766,17 @@ class StockGui(tk.Tk):
         ):
             return
 
-        changes = stock_app.bulk_price_increase(self.conn, codigos, pct)
+        changes = self._svc.aumento_masivo(codigos, pct)
         if changes:
             self._push_undo({
                 "type": "price_increase",
                 "changes": changes,
                 "description": f"aumento {pct:.1f}% a {len(changes)} producto(s)",
             })
-        self.refresh_all()
+            logger.info("Aumento masivo %.1f%% a %d productos", pct, len(changes))
+        self._refresh_after_price_change()
         self.aumento_var.set("")
-        self._set_status(f"✓ Aumento {pct:.1f}% aplicado a {len(changes)} producto(s).")
+        self._set_status(f"Aumento {pct:.1f}% aplicado a {len(changes)} producto(s).")
 
     def _load_price_row_for_edit(self) -> None:
         selected = self.price_table.selection()
@@ -1549,21 +1784,20 @@ class StockGui(tk.Tk):
             return
         codigo = self.price_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError:
             return
         self.enter_edit_mode(product)
 
     # =========================================================================
-    # Ventas del día
+    # Ventas del dia
     # =========================================================================
 
     def refresh_ventas(self) -> None:
         clear_table(self.ventas_table)
         running_total = 0.0
         if self._ventas_range_active:
-            ventas = stock_app.get_ventas_rango(
-                self.conn,
+            ventas = self._svc.ventas_rango(
                 _date_from_ui(self._ventas_desde_var.get()).isoformat(),
                 _date_from_ui(self._ventas_hasta_var.get()).isoformat(),
             )
@@ -1583,12 +1817,12 @@ class StockGui(tk.Tk):
                 )
             self._ventas_total_var.set(f"Total del rango: ${running_total:.2f}")
             self._ventas_summary_var.set(
-                f"Rango {self._ventas_desde_var.get()} → {self._ventas_hasta_var.get()}: "
+                f"Rango {self._ventas_desde_var.get()} -> {self._ventas_hasta_var.get()}: "
                 f"{len(ventas)} ventas  |  ${running_total:.2f}"
             )
         else:
             selected_date = self._selected_ventas_date()
-            for row in stock_app.get_ventas_hoy(self.conn, cash_date=selected_date):
+            for row in self._svc.ventas_hoy(cash_date=selected_date):
                 running_total += float(row["total"])
                 self.ventas_table.insert(
                     "", "end",
@@ -1602,12 +1836,12 @@ class StockGui(tk.Tk):
                         row["forma_pago"],
                     ),
                 )
-            self._ventas_total_var.set(f"Total del día: ${running_total:.2f}")
+            self._ventas_total_var.set(f"Total del dia: ${running_total:.2f}")
             self._update_ventas_summary()
 
     def _update_ventas_summary(self) -> None:
         selected_date = self._selected_ventas_date()
-        summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
+        summary = self._svc.resumen_diario(cash_date=selected_date)
         label_date = _date_to_ui(selected_date) if selected_date else _date_to_ui(date.today())
         is_today = (selected_date is None or selected_date == date.today())
         prefix = "Hoy" if is_today else label_date
@@ -1629,19 +1863,18 @@ class StockGui(tk.Tk):
         if self._ventas_range_active:
             desde = self._ventas_desde_var.get()
             hasta = self._ventas_hasta_var.get()
-            summary = stock_app.get_range_summary(
-                self.conn,
+            summary = self._svc.resumen_rango(
                 _date_from_ui(desde).isoformat(),
                 _date_from_ui(hasta).isoformat(),
             )
             breakdown = summary["breakdown"]
             ttk.Label(frame, text="Cierre de rango", font=("Segoe UI", 14, "bold")).pack(anchor="w")
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
-            ttk.Label(frame, text=f"Desde: {desde}  —  Hasta: {hasta}").pack(anchor="w")
+            ttk.Label(frame, text=f"Desde: {desde}  -  Hasta: {hasta}").pack(anchor="w")
         else:
             selected_date = self._selected_ventas_date()
-            summary = stock_app.get_daily_summary(self.conn, cash_date=selected_date)
-            breakdown = stock_app.get_payment_breakdown(self.conn, cash_date=selected_date)
+            summary = self._svc.resumen_diario(cash_date=selected_date)
+            breakdown = self._svc.desglose_pagos(cash_date=selected_date)
             ttk.Label(frame, text="Cierre de caja", font=("Segoe UI", 14, "bold")).pack(anchor="w")
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(frame, text=f"Fecha: {summary['fecha']}").pack(anchor="w")
@@ -1673,18 +1906,18 @@ class StockGui(tk.Tk):
             for row in breakdown:
                 ttk.Label(
                     frame,
-                    text=f"  • {row['forma_pago']}: {row['cantidad']} venta(s) — ${row['total']:.2f}",
+                    text=f"  - {row['forma_pago']}: {row['cantidad']} venta(s) - ${row['total']:.2f}",
                 ).pack(anchor="w", pady=(2, 0))
 
         if summary.get("top_products"):
             ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
             ttk.Label(
-                frame, text="Productos más vendidos:", font=("Segoe UI", 10, "bold")
+                frame, text="Productos mas vendidos:", font=("Segoe UI", 10, "bold")
             ).pack(anchor="w")
             for p in summary["top_products"]:
                 ttk.Label(
                     frame,
-                    text=f"  • {p['nombre'][:32]} — {p['total_cant']} unid. — ${p['total_monto']:.2f}",
+                    text=f"  - {p['nombre'][:32]} - {p['total_cant']} unid. - ${p['total_monto']:.2f}",
                 ).pack(anchor="w", pady=(2, 0))
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=8)
@@ -1699,8 +1932,8 @@ class StockGui(tk.Tk):
         )
         if not filepath:
             return
-        n = stock_app.export_ventas_csv(self.conn, Path(filepath))
-        self._set_status(f"✓ Exportadas {n} ventas a {Path(filepath).name}")
+        n = self._svc.exportar_ventas_csv(Path(filepath))
+        self._set_status(f"Exportadas {n} ventas a {Path(filepath).name}")
 
     def _export_products_csv(self) -> None:
         filepath = filedialog.asksaveasfilename(
@@ -1710,10 +1943,10 @@ class StockGui(tk.Tk):
         )
         if not filepath:
             return
-        n = stock_app.export_products_csv(self.conn, Path(filepath))
-        self._set_status(f"✓ Exportados {n} productos a {Path(filepath).name}")
+        n = self._svc.exportar_productos_csv(Path(filepath))
+        self._set_status(f"Exportados {n} productos a {Path(filepath).name}")
 
-    # ── Tab 5: reportes ───────────────────────────────────────────────────────
+    # â”€â”€ Tab 5: reportes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_tab_reportes(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1727,13 +1960,13 @@ class StockGui(tk.Tk):
         sec_frame.grid(row=1, column=0, sticky="ew")
         sec_frame.columnconfigure(1, weight=1)
 
-        # ── Productos ─────────────────────────────────────────────────────────
+        # â”€â”€ Productos â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ttk.Checkbutton(
             sec_frame, text="Todos los productos",
             variable=self._rep_productos_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # ── Ventas ────────────────────────────────────────────────────────────
+        # â”€â”€ Ventas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ventas_cb = ttk.Checkbutton(
             sec_frame, text="Ventas",
             variable=self._rep_ventas_var,
@@ -1751,25 +1984,25 @@ class StockGui(tk.Tk):
         self._rep_hasta_entry.grid(row=0, column=3)
 
         hint_lbl = ttk.Label(
-            sec_frame, text="Formato DD-MM-AAAA. Dejá vacío para usar solo la fecha de hoy.",
+            sec_frame, text="Formato DD-MM-AAAA. Deja vacio para usar solo la fecha de hoy.",
             foreground="gray", font=("Segoe UI", 8),
         )
         hint_lbl.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(2, 10))
         self._muted_labels.append(hint_lbl)
 
-        # ── Pendientes ────────────────────────────────────────────────────────
+        # â”€â”€ Pendientes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ttk.Checkbutton(
             sec_frame, text="Pendientes",
             variable=self._rep_pendientes_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # ── Stock bajo ────────────────────────────────────────────────────────
+        # â”€â”€ Stock bajo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ttk.Checkbutton(
             sec_frame, text="Stock bajo",
             variable=self._rep_stock_bajo_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w")
 
-        # ── Botón generar ─────────────────────────────────────────────────────
+        # â”€â”€ BotÃ³n generar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         btn_row = ttk.Frame(parent)
         btn_row.grid(row=2, column=0, sticky="e", pady=(18, 0))
         ttk.Button(
@@ -1782,19 +2015,36 @@ class StockGui(tk.Tk):
         self._rep_hasta_entry.configure(state=state)
 
     def _generar_reporte_pdf(self) -> None:
-        if not any([
-            self._rep_productos_var.get(),
-            self._rep_ventas_var.get(),
-            self._rep_pendientes_var.get(),
-            self._rep_stock_bajo_var.get(),
-        ]):
-            messagebox.showwarning("Aviso", "Seleccioná al menos una sección.")
+        options: dict[str, Any] = {
+            "productos": self._rep_productos_var.get(),
+            "ventas": self._rep_ventas_var.get(),
+            "pendientes": self._rep_pendientes_var.get(),
+            "stock_bajo": self._rep_stock_bajo_var.get(),
+        }
+        if not any(options.values()):
+            messagebox.showwarning("Aviso", "Selecciona al menos una seccion.")
             return
 
+        if options["ventas"]:
+            desde_raw = self._rep_desde_var.get().strip()
+            hasta_raw = self._rep_hasta_var.get().strip()
+            try:
+                options["desde"] = _date_from_ui(desde_raw) if desde_raw else date.today()
+                options["hasta"] = _date_from_ui(hasta_raw) if hasta_raw else date.today()
+            except ValueError:
+                messagebox.showerror(
+                    "Error",
+                    "Fechas invalidas en la seccion Ventas. Usa el formato DD-MM-AAAA.",
+                )
+                return
+            if options["desde"] > options["hasta"]:
+                messagebox.showerror("Error", "La fecha Desde debe ser anterior o igual a Hasta.")
+                return
+
         try:
-            from fpdf import FPDF  # type: ignore
+            import fpdf  # type: ignore[import-untyped]  # noqa: F401
         except ImportError:
-            messagebox.showerror("Error", "Falta la librería fpdf2.\nEjecutá: pip install fpdf2")
+            messagebox.showerror("Error", "Falta la libreria fpdf2. Ejecuta: pip install fpdf2")
             return
 
         filepath = filedialog.asksaveasfilename(
@@ -1805,194 +2055,44 @@ class StockGui(tk.Tk):
         if not filepath:
             return
 
-        moneda = self._config.get("moneda", "$")
-        negocio = self._config.get("nombre_negocio", "Reporte")
-
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_page()
-
-        # ── Encabezado ────────────────────────────────────────────────────────
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, negocio, ln=True, align="C")
-        pdf.set_font("Helvetica", "", 9)
-        pdf.cell(0, 6, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
-        pdf.ln(8)
-
-        # ── Sección: todos los productos ──────────────────────────────────────
-        if self._rep_productos_var.get():
-            productos = stock_app.list_products(self.conn)
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.set_fill_color(220, 220, 220)
-            pdf.cell(0, 8, f"Productos ({len(productos)})", ln=True, fill=True)
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 8)
-            for h, w in [("Código", 25), ("Nombre", 65), ("Precio", 25),
-                         ("Costo", 25), ("Stock", 18), ("Mín.", 18), ("Proveedor", 14)]:
-                pdf.cell(w, 7, h, border=1, align="C")
-            pdf.ln()
-            pdf.set_font("Helvetica", "", 8)
-            for p in productos:
-                precio = float(p["precio"])
-                costo = float(p["precio_costo"])
-                pdf.cell(25, 6, str(p["codigo"]), border=1)
-                pdf.cell(65, 6, str(p["nombre"])[:38], border=1)
-                pdf.cell(25, 6, f"{moneda}{precio:.2f}", border=1, align="R")
-                pdf.cell(25, 6, f"{moneda}{costo:.2f}" if costo > 0 else "-", border=1, align="R")
-                pdf.cell(18, 6, str(p["stock"]), border=1, align="C")
-                pdf.cell(18, 6, str(p["stock_minimo"]), border=1, align="C")
-                pdf.cell(14, 6, str(p["proveedor"] or "-")[:8], border=1)
-                pdf.ln()
-            pdf.ln(6)
-
-        # ── Sección: ventas ───────────────────────────────────────────────────
-        if self._rep_ventas_var.get():
-            desde_raw = self._rep_desde_var.get().strip()
-            hasta_raw = self._rep_hasta_var.get().strip()
-            hoy = date.today().isoformat()
-            try:
-                desde = _date_from_ui(desde_raw).isoformat() if desde_raw else hoy
-                hasta = _date_from_ui(hasta_raw).isoformat() if hasta_raw else hoy
-            except ValueError:
-                messagebox.showerror("Error", "Fechas inválidas en la sección Ventas.\nUsá el formato DD-MM-AAAA.")
-                return
-
-            ventas = stock_app.get_ventas_rango(self.conn, desde, hasta)
-            resumen = stock_app.get_range_summary(self.conn, desde, hasta)
-
-            titulo_ventas = (
-                f"Ventas del {desde}"
-                if desde == hasta
-                else f"Ventas del {desde} al {hasta}"
-            )
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.set_fill_color(220, 220, 220)
-            pdf.cell(0, 8, titulo_ventas, ln=True, fill=True)
-            pdf.ln(2)
-
-            # Resumen financiero
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.cell(60, 6, f"Total: {moneda}{resumen['total']:.2f}", border=0)
-            pdf.cell(60, 6, f"Transacciones: {resumen['count']}", border=0)
-            ganancia = resumen.get("ganancia_bruta", 0)
-            pdf.cell(0, 6, f"Ganancia bruta: {moneda}{ganancia:.2f}", ln=True, border=0)
-
-            # Desglose por forma de pago
-            if resumen["breakdown"]:
-                pdf.set_font("Helvetica", "", 8)
-                for row in resumen["breakdown"]:
-                    pdf.cell(0, 5,
-                             f"  {row['forma_pago']}: {row['cantidad']} ventas — {moneda}{float(row['total']):.2f}",
-                             ln=True)
-            pdf.ln(3)
-
-            # Tabla de ventas
-            pdf.set_font("Helvetica", "B", 8)
-            for h, w in [("Fecha", 22), ("Hora", 18), ("Nombre", 70),
-                         ("Cant.", 14), ("P.Unit.", 24), ("Total", 24), ("Pago", 18)]:
-                pdf.cell(w, 7, h, border=1, align="C")
-            pdf.ln()
-            pdf.set_font("Helvetica", "", 8)
-            for v in ventas:
-                pdf.cell(22, 6, str(v["fecha"]), border=1)
-                pdf.cell(18, 6, str(v["hora"])[:5], border=1, align="C")
-                pdf.cell(70, 6, str(v["nombre"])[:42], border=1)
-                pdf.cell(14, 6, str(v["cantidad"]), border=1, align="C")
-                pdf.cell(24, 6, f"{moneda}{float(v['precio_unit']):.2f}", border=1, align="R")
-                pdf.cell(24, 6, f"{moneda}{float(v['total']):.2f}", border=1, align="R")
-                pdf.cell(18, 6, str(v["forma_pago"])[:10], border=1)
-                pdf.ln()
-
-            # Top 5 productos
-            if resumen["top_products"]:
-                pdf.ln(3)
-                pdf.set_font("Helvetica", "B", 9)
-                pdf.cell(0, 6, "Top 5 productos más vendidos:", ln=True)
-                pdf.set_font("Helvetica", "", 8)
-                for i, row in enumerate(resumen["top_products"], 1):
-                    pdf.cell(0, 5,
-                             f"  {i}. {row['nombre']} — {row['total_cant']} unid. — {moneda}{float(row['total_monto']):.2f}",
-                             ln=True)
-            pdf.ln(6)
-
-        # ── Sección: pendientes ───────────────────────────────────────────────
-        if self._rep_pendientes_var.get():
-            pendientes = stock_app.list_pending(self.conn)
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.set_fill_color(220, 220, 220)
-            pdf.cell(0, 8, f"Pendientes ({len(pendientes)})", ln=True, fill=True)
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 8)
-            for h, w in [("Estado", 30), ("Descripción", 120), ("Creado", 40)]:
-                pdf.cell(w, 7, h, border=1, align="C")
-            pdf.ln()
-            pdf.set_font("Helvetica", "", 8)
-            for p in pendientes:
-                pdf.cell(30, 6, str(p["estado"]), border=1, align="C")
-                pdf.cell(120, 6, str(p["descripcion"])[:65], border=1)
-                pdf.cell(40, 6, str(p["creado_en"])[:16], border=1, align="C")
-                pdf.ln()
-            pdf.ln(6)
-
-        # ── Sección: stock bajo ───────────────────────────────────────────────
-        if self._rep_stock_bajo_var.get():
-            bajo = stock_app.low_stock_products(self.conn)
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.set_fill_color(220, 220, 220)
-            pdf.cell(0, 8, f"Stock bajo ({len(bajo)} productos)", ln=True, fill=True)
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 8)
-            for h, w in [("Código", 30), ("Nombre", 100), ("Stock actual", 30), ("Stock mín.", 30)]:
-                pdf.cell(w, 7, h, border=1, align="C")
-            pdf.ln()
-            pdf.set_font("Helvetica", "", 8)
-            for p in bajo:
-                pdf.cell(30, 6, str(p["codigo"]), border=1)
-                pdf.cell(100, 6, str(p["nombre"])[:55], border=1)
-                pdf.cell(30, 6, str(p["stock"]), border=1, align="C")
-                pdf.cell(30, 6, str(p["stock_minimo"]), border=1, align="C")
-                pdf.ln()
-
-        pdf.output(filepath)
-        self._set_status(f"✓ PDF exportado: {Path(filepath).name}")
-
+        self._report_gen.generate(filepath, options)
+        self._set_status(f"PDF exportado: {Path(filepath).name}")
     # =========================================================================
     # Undo
     # =========================================================================
 
     def _push_undo(self, action: dict[str, Any]) -> None:
-        self._undo_stack.append(action)
-        if len(self._undo_stack) > _UNDO_MAX:
-            self._undo_stack.pop(0)
-        self._redo_stack.clear()
+        self._undo_mgr.push(action)
         self._update_undo_redo_btns()
 
     def _update_undo_redo_btns(self) -> None:
-        if self._undo_stack:
+        undo_description = self._undo_mgr.next_undo_description
+        if undo_description:
             self._undo_btn.configure(
                 state="normal",
-                text=f"↩ Deshacer: {self._undo_stack[-1]['description'][:35]}",
+                text=f"Deshacer: {undo_description[:35]}",
             )
         else:
-            self._undo_btn.configure(state="disabled", text="↩ Deshacer (Ctrl+Z)")
-        if self._redo_stack:
+            self._undo_btn.configure(state="disabled", text="Deshacer (Ctrl+Z)")
+        redo_description = self._undo_mgr.next_redo_description
+        if redo_description:
             self._redo_btn.configure(
                 state="normal",
-                text=f"↪ Rehacer: {self._redo_stack[-1]['description'][:35]}",
+                text=f"Rehacer: {redo_description[:35]}",
             )
         else:
-            self._redo_btn.configure(state="disabled", text="↪ Rehacer (Ctrl+Y)")
+            self._redo_btn.configure(state="disabled", text="Rehacer (Ctrl+Y)")
 
     def _undo(self) -> None:
-        if not self._undo_stack:
+        action = self._undo_mgr.pop_undo()
+        if action is None:
             return
-        action = self._undo_stack.pop()
         cart_action_handled = False
         redo_entry: dict[str, Any] | None = None
 
         try:
             if action["type"] == "delete_product":
-                stock_app._restore_product(self.conn, action["data"])
+                self._svc.restaurar_producto(action["data"])
                 redo_entry = {
                     "type": "redo_delete",
                     "codigo": action["data"]["codigo"],
@@ -2005,12 +2105,11 @@ class StockGui(tk.Tk):
                 sale_data: dict | None = None
                 if sale_id is not None:
                     try:
-                        row = stock_app.get_sale(self.conn, sale_id)
+                        row = self._svc.obtener_venta(sale_id)
                         sale_data = dict(row)
                     except stock_app.StockError:
                         pass
-                stock_app.reverse_sale(
-                    self.conn,
+                self._svc.revertir_venta(
                     action["codigo"],
                     action["cantidad"],
                     action["total"],
@@ -2025,7 +2124,7 @@ class StockGui(tk.Tk):
                     }
 
             elif action["type"] == "price_increase":
-                stock_app.restore_prices(self.conn, action["changes"])
+                self._svc.restaurar_precios(action["changes"])
                 redo_entry = {
                     "type": "redo_price_increase",
                     "changes": action["changes"],
@@ -2078,19 +2177,19 @@ class StockGui(tk.Tk):
             return
 
         if redo_entry:
-            self._redo_stack.append(redo_entry)
+            self._undo_mgr.push_redo(redo_entry)
 
         if cart_action_handled:
             self._refresh_cart_display()
 
         self._update_undo_redo_btns()
-        self.refresh_all()
-        self._set_status(f"↩ Revertido: {action.get('description', '')}")
+        self._refresh_after_undo_redo(action["type"])
+        self._set_status(f"Revertido: {action.get('description', '')}")
 
     def _redo(self) -> None:
-        if not self._redo_stack:
+        action = self._undo_mgr.pop_redo()
+        if action is None:
             return
-        action = self._redo_stack.pop()
         cart_action_handled = False
         undo_entry: dict[str, Any] | None = None
 
@@ -2098,9 +2197,7 @@ class StockGui(tk.Tk):
             if action["type"] == "redo_delete":
                 codigo = action["codigo"]
                 try:
-                    product = stock_app.get_product(self.conn, codigo)
-                    undo_data = {k: product[k] for k in product.keys()}
-                    stock_app.delete_product(self.conn, codigo)
+                    undo_data = self._svc.eliminar_producto(codigo)
                     undo_entry = {
                         "type": "delete_product",
                         "data": undo_data,
@@ -2108,13 +2205,13 @@ class StockGui(tk.Tk):
                     }
                 except stock_app.ProductNotFoundError as exc:
                     messagebox.showerror("Error al rehacer", str(exc))
-                    self._redo_stack.clear()
+                    self._undo_mgr.clear_redo()
                     self._update_undo_redo_btns()
                     return
 
             elif action["type"] == "redo_sale":
                 sale_data = action["sale_data"]
-                stock_app.restore_sale(self.conn, sale_data)
+                self._svc.restaurar_venta(sale_data)
                 undo_entry = {
                     "type": "sale",
                     "codigo": sale_data["codigo"],
@@ -2126,7 +2223,7 @@ class StockGui(tk.Tk):
                 }
 
             elif action["type"] == "redo_price_increase":
-                stock_app.re_apply_prices(self.conn, action["changes"])
+                self._svc.reaplicar_precios(action["changes"])
                 undo_entry = {
                     "type": "price_increase",
                     "changes": action["changes"],
@@ -2185,16 +2282,14 @@ class StockGui(tk.Tk):
             return
 
         if undo_entry:
-            self._undo_stack.append(undo_entry)
-            if len(self._undo_stack) > _UNDO_MAX:
-                self._undo_stack.pop(0)
+            self._undo_mgr.push_undo_from_redo(undo_entry)
 
         if cart_action_handled:
             self._refresh_cart_display()
 
         self._update_undo_redo_btns()
-        self.refresh_all()
-        self._set_status(f"↪ Rehecho: {action.get('description', '')}")
+        self._refresh_after_undo_redo(action["type"])
+        self._set_status(f"Rehecho: {action.get('description', '')}")
 
     # =========================================================================
     # Form helpers
@@ -2220,7 +2315,7 @@ class StockGui(tk.Tk):
             return
         codigo = self.products_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -2239,7 +2334,7 @@ class StockGui(tk.Tk):
         ttk.Label(frame, text=product["nombre"], style="Bold.TLabel").grid(
             row=0, column=1, sticky="w", pady=(0, 4)
         )
-        ttk.Label(frame, text="Código:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Label(frame, text="Codigo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         ttk.Label(frame, text=product["codigo"]).grid(row=1, column=1, sticky="w", pady=(0, 4))
         ttk.Label(frame, text="Stock actual:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
         ttk.Label(frame, text=str(product["stock"]), style="Bold.TLabel").grid(
@@ -2261,17 +2356,17 @@ class StockGui(tk.Tk):
             try:
                 nuevo = parse_int(nuevo_var.get(), "stock")
             except ValueError as exc:
-                messagebox.showerror("Valor inválido", str(exc), parent=dialog)
+                messagebox.showerror("Valor invalido", str(exc), parent=dialog)
                 return
             try:
-                anterior = stock_app.adjust_stock(self.conn, codigo, nuevo)
+                anterior = self._svc.ajustar_stock(codigo, nuevo)
             except stock_app.StockError as exc:
                 messagebox.showerror("Error", str(exc), parent=dialog)
                 return
             dialog.destroy()
-            self.refresh_all()
+            self._refresh_after_stock_change()
             self._set_status(
-                f"✓ Stock de '{product['nombre']}' ajustado: {anterior} → {nuevo}"
+                f"Stock de '{product['nombre']}' ajustado: {anterior} -> {nuevo}"
             )
 
         ttk.Button(btn_row, text="Guardar", command=_guardar).pack(side="right", padx=(8, 0))
@@ -2286,17 +2381,17 @@ class StockGui(tk.Tk):
         if not desde or not hasta:
             messagebox.showerror(
                 "Fechas requeridas",
-                "Ingresá ambas fechas en formato DD-MM-AAAA.",
+                "Ingresa ambas fechas en formato DD-MM-AAAA.",
             )
             return
         try:
             d_desde = _date_from_ui(desde)
             d_hasta = _date_from_ui(hasta)
         except ValueError:
-            messagebox.showerror("Formato inválido", "Usá el formato DD-MM-AAAA.")
+            messagebox.showerror("Formato invalido", "Usa el formato DD-MM-AAAA.")
             return
         if d_desde > d_hasta:
-            messagebox.showerror("Rango inválido", "La fecha 'Desde' debe ser anterior a 'Hasta'.")
+            messagebox.showerror("Rango invalido", "La fecha 'Desde' debe ser anterior a 'Hasta'.")
             return
         self._ventas_range_active = True
         for btn in (self._nav_prev_btn, self._nav_next_btn, self._nav_today_btn):
@@ -2335,8 +2430,8 @@ class StockGui(tk.Tk):
             notas = self.notas_var.get().strip()
             if not codigo or not nombre:
                 raise ValueError("Codigo y nombre son obligatorios.")
-            stock_app.add_product(
-                self.conn, codigo, nombre, precio, stock, stock_minimo,
+            self._svc.agregar_producto(
+                codigo, nombre, precio, stock, stock_minimo,
                 proveedor, precio_costo, notas,
             )
         except (ValueError, stock_app.StockError) as exc:
@@ -2345,8 +2440,8 @@ class StockGui(tk.Tk):
 
         saved_name = nombre
         self._clear_form()
-        self.refresh_all()
-        self._set_status(f"✓ Producto '{saved_name}' registrado.")
+        self._refresh_after_product_change()
+        self._set_status(f"Producto '{saved_name}' registrado.")
 
     def _do_update_product(self) -> None:
         try:
@@ -2359,8 +2454,7 @@ class StockGui(tk.Tk):
             notas = self.notas_var.get().strip()
             if not nombre:
                 raise ValueError("El nombre es obligatorio.")
-            stock_app.update_product(
-                self.conn,
+            self._svc.actualizar_producto(
                 self._edit_codigo,  # type: ignore[arg-type]
                 nombre, precio, stock, stock_minimo,
                 proveedor, precio_costo, notas,
@@ -2371,8 +2465,8 @@ class StockGui(tk.Tk):
 
         saved_name = nombre
         self.cancel_edit()
-        self.refresh_all()
-        self._set_status(f"✓ Producto '{saved_name}' actualizado.")
+        self._refresh_after_product_change()
+        self._set_status(f"Producto '{saved_name}' actualizado.")
 
     def enter_edit_mode(self, product: sqlite3.Row) -> None:
         if not self._form_visible:
@@ -2419,7 +2513,7 @@ class StockGui(tk.Tk):
             return
         codigo = self.products_table.item(selected[0], "values")[0]
         try:
-            product = stock_app.get_product(self.conn, codigo)
+            product = self._svc.obtener_producto(codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -2437,9 +2531,8 @@ class StockGui(tk.Tk):
         ):
             return
         try:
-            product = stock_app.get_product(self.conn, codigo)
-            undo_data = {k: product[k] for k in product.keys()}
-            stock_app.delete_product(self.conn, codigo)
+            undo_data = self._svc.eliminar_producto(codigo)
+            logger.info("Producto eliminado: %s", codigo)
         except stock_app.StockError as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -2451,7 +2544,7 @@ class StockGui(tk.Tk):
         })
         if self._edit_mode and self._edit_codigo == codigo:
             self.cancel_edit()
-        self.refresh_all()
+        self._refresh_after_product_change()
 
     # =========================================================================
     # Sale
@@ -2462,27 +2555,32 @@ class StockGui(tk.Tk):
         forma_pago = self._venta_forma_pago_var.get() or "Efectivo"
         try:
             cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
-            sale_date = date.today()
-            total, sale_id = stock_app.register_sale(
-                self.conn, codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
+        except ValueError as exc:
+            messagebox.showerror("No se pudo registrar", str(exc))
+            return
+
+        sale_date = date.today()
+        try:
+            total, sale_id = self._svc.vender(
+                codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
             )
         except stock_app.ProductNotFoundError:
             if messagebox.askyesno(
                 "Producto no encontrado",
-                f"No existe ningún producto con código '{codigo}'.\n\n¿Querés agregarlo ahora?",
+                f"No existe ningun producto con codigo '{codigo}'.\n\nQueres agregarlo ahora?",
             ):
                 self._start_add_product_with_code(codigo)
             return
         except stock_app.InsufficientStockError as exc:
             allow = messagebox.askyesno(
                 "Stock insuficiente",
-                f"{exc}\n\n¿Autorizar venta con stock negativo?",
+                f"{exc}\n\nAutorizar venta con stock negativo?",
             )
             if not allow:
                 return
             try:
-                total, sale_id = stock_app.register_sale(
-                    self.conn, codigo, cantidad, allow_negative=True,
+                total, sale_id = self._svc.vender(
+                    codigo, cantidad, allow_negative=True,
                     sale_date=sale_date, forma_pago=forma_pago,
                 )
             except (ValueError, stock_app.StockError) as retry_exc:
@@ -2505,8 +2603,9 @@ class StockGui(tk.Tk):
         })
         self.venta_codigo_var.set("")
         self.venta_cantidad_var.set("1")
-        self.refresh_all()
-        self._set_status(f"✓ Venta registrada [{forma_pago}] - Total: ${total:.2f}")
+        self._refresh_after_sale()
+        logger.info("Venta: %s x%d $%.2f", codigo, cantidad, total)
+        self._set_status(f"Venta registrada [{forma_pago}] - Total: ${total:.2f}")
         self._venta_codigo_entry.focus_set()
 
     # =========================================================================
@@ -2518,10 +2617,10 @@ class StockGui(tk.Tk):
         if not descripcion:
             messagebox.showerror("Dato obligatorio", "Ingrese una descripcion.")
             return
-        stock_app.add_pending(self.conn, descripcion)
+        self._svc.agregar_pendiente(descripcion)
         self.pendiente_var.set("")
-        self.refresh_pending()
-        self._set_status("✓ Pendiente agregado.")
+        self._refresh_after_pending_change()
+        self._set_status("Pendiente agregado.")
 
     def complete_selected_pending(self) -> None:
         selected = self.pending_table.selection()
@@ -2529,8 +2628,8 @@ class StockGui(tk.Tk):
             messagebox.showerror("Seleccione un pendiente", "Elija un item de la lista.")
             return
         pending_id = int(selected[0])
-        stock_app.complete_pending(self.conn, pending_id)
-        self.refresh_pending()
+        self._svc.completar_pendiente(pending_id)
+        self._refresh_after_pending_change()
 
     def delete_selected_pending(self) -> None:
         selected = self.pending_table.selection()
@@ -2538,10 +2637,10 @@ class StockGui(tk.Tk):
             messagebox.showerror("Seleccione un pendiente", "Elija un item de la lista.")
             return
         pending_id = int(selected[0])
-        if not messagebox.askyesno("Confirmar", "¿Eliminar este pendiente definitivamente?"):
+        if not messagebox.askyesno("Confirmar", "Eliminar este pendiente definitivamente?"):
             return
-        stock_app.delete_pending(self.conn, pending_id)
-        self.refresh_pending()
+        self._svc.eliminar_pendiente(pending_id)
+        self._refresh_after_pending_change()
 
     # =========================================================================
     # Refresh
@@ -2551,21 +2650,76 @@ class StockGui(tk.Tk):
         self.refresh_products()
         self.refresh_alerts()
         self.refresh_pending()
-        self.caja_var.set(f"Caja de hoy: ${stock_app.daily_cash(self.conn):.2f}")
-        self._update_ventas_summary()
+        self._update_caja_y_ventas()
         self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_visible_tabs(self) -> None:
         idx = self._notebook.index("current")
         if idx == 2:
             self.refresh_price_table()
         elif idx == 3:
             self.refresh_ventas()
 
+    def _update_caja_y_ventas(self) -> None:
+        self.caja_var.set(f"Caja de hoy: ${self._svc.caja_hoy():.2f}")
+        self._update_ventas_summary()
+
+    def _refresh_after_sale(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._update_caja_y_ventas()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_product_change(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_price_change(self) -> None:
+        self.refresh_products()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_stock_change(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+
+    def _refresh_after_supplier_change(self) -> None:
+        self.refresh_products()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_pending_change(self) -> None:
+        self.refresh_pending()
+        self._refresh_dashboard()
+
+    def _refresh_after_import(self) -> None:
+        self.refresh_products()
+        self.refresh_alerts()
+        self._refresh_dashboard()
+        self._refresh_visible_tabs()
+
+    def _refresh_after_undo_redo(self, action_type: str) -> None:
+        if action_type in ("sale", "redo_sale"):
+            self._refresh_after_sale()
+        elif action_type in ("delete_product", "redo_delete"):
+            self._refresh_after_product_change()
+        elif action_type in ("price_increase", "redo_price_increase"):
+            self._refresh_after_price_change()
+        elif action_type in ("cart_change", "cart_remove", "cart_clear",
+                             "redo_cart_remove", "redo_cart_clear"):
+            return
+        else:
+            self.refresh_all()
+
     def refresh_products(self) -> None:
         clear_table(self.products_table)
         query = self.search_var.get().strip()
 
         rows_data = []
-        for row in stock_app.search_products(self.conn, query):
+        for row in self._svc.buscar_productos(query):
             precio = float(row["precio"])
             costo = float(row["precio_costo"])
             margen = _calc_margen(precio, costo)
@@ -2586,7 +2740,7 @@ class StockGui(tk.Tk):
         col_idx = {"codigo": 0, "nombre": 1, "precio": 2, "margen": 3,
                    "stock": 4, "minimo": 5, "proveedor": 6}
         label_map = {"codigo": "Codigo", "nombre": "Nombre", "precio": "Precio",
-                     "margen": "Margen", "stock": "Stock", "minimo": "Stock mín.",
+                     "margen": "Margen", "stock": "Stock", "minimo": "Stock min.",
                      "proveedor": "Proveedor"}
         if self._sort_col in col_idx:
             idx = col_idx[self._sort_col]
@@ -2600,7 +2754,7 @@ class StockGui(tk.Tk):
                 return v
             rows_data.sort(key=_key, reverse=not self._sort_asc)
             for c in col_idx:
-                arrow = (" ▲" if self._sort_asc else " ▼") if c == self._sort_col else ""
+                arrow = (" ^" if self._sort_asc else " v") if c == self._sort_col else ""
                 self.products_table.heading(c, text=label_map[c] + arrow)
 
         for row in rows_data:
@@ -2612,7 +2766,7 @@ class StockGui(tk.Tk):
 
     def refresh_alerts(self) -> None:
         clear_table(self.alerts_table)
-        for row in stock_app.low_stock_products(self.conn):
+        for row in self._svc.stock_bajo():
             tag = "critical" if row["stock"] <= 0 else "warning"
             self.alerts_table.insert(
                 "", "end",
@@ -2622,7 +2776,7 @@ class StockGui(tk.Tk):
 
     def refresh_pending(self) -> None:
         clear_table(self.pending_table)
-        for row in stock_app.list_pending(self.conn):
+        for row in self._svc.listar_pendientes():
             self.pending_table.insert(
                 "", "end",
                 iid=str(row["id"]),
@@ -2633,7 +2787,7 @@ class StockGui(tk.Tk):
         clear_table(self.price_table)
         text_filter = self.price_search_var.get().strip()
         prov_filter = self.price_proveedor_var.get().strip().lower()
-        for row in stock_app.search_products(self.conn, text_filter):
+        for row in self._svc.buscar_productos(text_filter):
             if prov_filter and prov_filter not in (row["proveedor"] or "").lower():
                 continue
             precio = float(row["precio"])
@@ -2721,7 +2875,7 @@ class StockGui(tk.Tk):
         self._dark_mode = not self._dark_mode
         self._config["dark_mode"] = self._dark_mode
         stock_app.save_config(self._config)
-        self._dark_mode_btn.configure(text="☀" if self._dark_mode else "🌙")
+        self._dark_mode_btn.configure(text="Claro" if self._dark_mode else "Oscuro")
         self._apply_theme()
 
     def on_close(self) -> None:
@@ -2732,6 +2886,77 @@ class StockGui(tk.Tk):
     # Importar boleta CSV
     # =========================================================================
 
+    def _select_boleta_proveedor(self) -> str | None:
+        proveedores = self._svc.todos_los_proveedores()
+        new_option = "+ Nuevo proveedor..."
+        values = proveedores + [new_option]
+        result: dict[str, str | None] = {"value": None}
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Proveedor de boleta")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        proveedor_var = tk.StringVar(value=proveedores[0] if proveedores else new_option)
+        nuevo_var = tk.StringVar()
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(1, weight=1)
+
+        ttk.Label(outer, text="Proveedor:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        combo = ttk.Combobox(
+            outer,
+            textvariable=proveedor_var,
+            values=values,
+            state="readonly",
+            width=32,
+        )
+        combo.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(outer, text="Nuevo:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        nuevo_entry = ttk.Entry(outer, textvariable=nuevo_var, width=34)
+        nuevo_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def _sync_new_entry(*_args: object) -> None:
+            state = "normal" if proveedor_var.get() == new_option else "disabled"
+            nuevo_entry.configure(state=state)
+            if state == "normal":
+                nuevo_entry.focus_set()
+
+        def _accept() -> None:
+            selected = proveedor_var.get().strip()
+            if selected == new_option:
+                selected = nuevo_var.get().strip()
+                if not selected:
+                    messagebox.showerror(
+                        "Proveedor requerido",
+                        "Ingresa el nombre del proveedor nuevo.",
+                        parent=dialog,
+                    )
+                    return
+            result["value"] = selected
+            dialog.destroy()
+
+        def _cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(btn_row, text="Cancelar", command=_cancel).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_row, text="Importar", command=_accept).pack(side="right")
+
+        combo.bind("<<ComboboxSelected>>", _sync_new_entry)
+        nuevo_entry.bind("<Return>", lambda _event: _accept())
+        dialog.bind("<Escape>", lambda _event: _cancel())
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        _sync_new_entry()
+        self._center_dialog(dialog)
+        self.wait_window(dialog)
+        return result["value"]
+
     def _import_boleta_csv(self) -> None:
         filepath = filedialog.askopenfilename(
             title="Seleccionar boleta CSV",
@@ -2740,15 +2965,22 @@ class StockGui(tk.Tk):
         if not filepath:
             return
 
+        proveedor_boleta = self._select_boleta_proveedor()
+        if proveedor_boleta is None:
+            return
+
         try:
-            result = stock_app.parse_and_classify_boleta(self.conn, Path(filepath))
+            result = self._svc.clasificar_boleta(
+                Path(filepath),
+                default_proveedor=proveedor_boleta,
+            )
         except stock_app.StockError as exc:
             messagebox.showerror("Error al leer CSV", str(exc))
             return
 
         total_valid = len(result.rows_new) + len(result.rows_clean) + len(result.rows_conflict)
         if total_valid == 0:
-            self._set_status("Sin datos: el CSV no contiene filas válidas.")
+            self._set_status("Sin datos: el CSV no contiene filas validas.")
             return
 
         # Apply rows without price conflict immediately
@@ -2756,14 +2988,14 @@ class StockGui(tk.Tk):
         n_clean = len(result.rows_clean)
         errors: list[str] = []
         if result.rows_new or result.rows_clean:
-            _, errors = stock_app.apply_boleta_batch(self.conn, result.rows_new + result.rows_clean)
+            _, errors = self._svc.aplicar_lote_boleta(result.rows_new + result.rows_clean)
 
         def _skipped_detail() -> str:
             if not result.skipped:
                 return ""
-            lines = [f"  Línea {ln}: {reason}" for ln, reason in result.skipped[:5]]
+            lines = [f"  Linea {ln}: {reason}" for ln, reason in result.skipped[:5]]
             if len(result.skipped) > 5:
-                lines.append(f"  ... y {len(result.skipped) - 5} más")
+                lines.append(f"  ... y {len(result.skipped) - 5} mas")
             return "\n\nFilas ignoradas:\n" + "\n".join(lines)
 
         def _build_summary(with_conflicts: bool) -> tuple[str, bool]:
@@ -2781,8 +3013,13 @@ class StockGui(tk.Tk):
             return text, bool(errors or result.skipped)
 
         def _on_conflicts_done() -> None:
-            self.refresh_all()
+            self._refresh_after_import()
             summary, has_detail = _build_summary(with_conflicts=True)
+            logger.info(
+                "Boleta importada: %d nuevos, %d actualizados",
+                n_new,
+                n_clean + len(result.rows_conflict),
+            )
             if has_detail:
                 parts_full = []
                 if n_new > 0:
@@ -2794,15 +3031,16 @@ class StockGui(tk.Tk):
                 if errors:
                     parts_full.append(f"{len(errors)} error(es)")
                 messagebox.showinfo(
-                    "Importación completada",
+                    "Importacion completada",
                     "\n".join(parts_full) + _skipped_detail(),
                 )
             else:
-                self._set_status(f"✓ Importación completada — {summary}")
+                self._set_status(f"Importacion completada - {summary}")
 
         if not result.rows_conflict:
-            self.refresh_all()
+            self._refresh_after_import()
             summary, has_detail = _build_summary(with_conflicts=False)
+            logger.info("Boleta importada: %d nuevos, %d actualizados", n_new, n_clean)
             if has_detail:
                 parts_full = []
                 if n_new > 0:
@@ -2812,11 +3050,11 @@ class StockGui(tk.Tk):
                 if errors:
                     parts_full.append(f"{len(errors)} error(es)")
                 messagebox.showinfo(
-                    "Importación completada",
+                    "Importacion completada",
                     "\n".join(parts_full) + _skipped_detail(),
                 )
             else:
-                self._set_status(f"✓ Importación completada — {summary}")
+                self._set_status(f"Importacion completada - {summary}")
             return
 
         ConflictoDialog(self, result.rows_conflict, self.conn, _on_conflicts_done)
@@ -2832,7 +3070,7 @@ class ConflictoDialog:
         parent: StockGui,
         conflicts: list,
         conn: sqlite3.Connection,
-        on_complete: object,
+        on_complete: Callable[[], None],
     ) -> None:
         self._parent = parent
         self._conflicts = conflicts
@@ -2903,7 +3141,7 @@ class ConflictoDialog:
             row=4, column=2, sticky="w", padx=(24, 0), pady=(4, 0)
         )
 
-        opt = ttk.LabelFrame(outer, text="Decisión para este producto", padding=10)
+        opt = ttk.LabelFrame(outer, text="Decision para este producto", padding=10)
         opt.pack(fill="x", pady=(0, 10))
 
         ttk.Radiobutton(
@@ -2949,11 +3187,11 @@ class ConflictoDialog:
         self._proveedor_var.set(row.proveedor or "(no especificado)")
         self._pc_actual_var.set(f"${float(db_row['precio_costo']):.2f}")
         self._pc_nuevo_var.set(
-            f"${row.precio_costo:.2f}" if row.precio_costo is not None else "—"
+            f"${row.precio_costo:.2f}" if row.precio_costo is not None else "-"
         )
         self._pv_actual_var.set(f"${float(db_row['precio']):.2f}")
         self._pv_nuevo_var.set(
-            f"${row.precio_venta:.2f}" if row.precio_venta is not None else "—"
+            f"${row.precio_venta:.2f}" if row.precio_venta is not None else "-"
         )
         self._opcion_var.set("keep")
         self._pct_var.set("")
@@ -2986,13 +3224,13 @@ class ConflictoDialog:
             pct = float(pct_raw.replace(",", "."))
             nuevo = float(db_row["precio"]) * (1 + pct / 100)
             if nuevo <= 0:
-                self._preview_var.set("⚠ Precio resultante ≤ 0")
+                self._preview_var.set("Precio resultante <= 0")
                 self._confirmar_btn.configure(state="disabled")
             else:
-                self._preview_var.set(f"→ ${nuevo:.2f}")
+                self._preview_var.set(f"-> ${nuevo:.2f}")
                 self._confirmar_btn.configure(state="normal")
         except ValueError:
-            self._preview_var.set("⚠ Ingrese un número")
+            self._preview_var.set("Ingrese un numero")
             self._confirmar_btn.configure(state="disabled")
 
     def _resolve_overrides(
@@ -3011,16 +3249,16 @@ class ConflictoDialog:
                 nuevo_pv = float(db_row["precio"]) * (1 + pct / 100)
                 if nuevo_pv <= 0:
                     messagebox.showerror(
-                        "Precio inválido",
-                        "El porcentaje resulta en un precio ≤ 0.",
+                        "Precio invalido",
+                        "El porcentaje resulta en un precio <= 0.",
                         parent=self._dialog,
                     )
                     return None
                 return nuevo_pv, None
             except ValueError:
                 messagebox.showerror(
-                    "Valor inválido",
-                    "Ingrese un porcentaje numérico válido.",
+                    "Valor invalido",
+                    "Ingrese un porcentaje numerico valido.",
                     parent=self._dialog,
                 )
                 return None
@@ -3055,8 +3293,8 @@ class ConflictoDialog:
                 pct = float(self._pct_var.get().strip().replace(",", "."))
             except ValueError:
                 messagebox.showerror(
-                    "Valor inválido",
-                    "Ingrese un porcentaje numérico válido.",
+                    "Valor invalido",
+                    "Ingrese un porcentaje numerico valido.",
                     parent=self._dialog,
                 )
                 return
@@ -3139,3 +3377,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
