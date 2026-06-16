@@ -789,7 +789,9 @@ def register_sale(
             (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
              total, sale_day, sale_hour, forma_pago, float(product["precio_costo"])),
         )
-        sale_id = int(cursor.lastrowid)
+        sale_id = cursor.lastrowid
+        if sale_id is None:
+            raise StockError("No se pudo obtener el id de la venta registrada.")
     return total, sale_id
 
 
