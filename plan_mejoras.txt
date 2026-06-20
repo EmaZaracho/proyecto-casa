@@ -1,482 +1,671 @@
-PLAN DE MEJORAS ARQUITECTURALES — Sistema de Stock
-====================================================
-Fecha: 2026-06-16
-Rama de trabajo: prueba-de-refactorizacion
+PLAN — MÓDULO CLIENTES MOROSOS (FIADO)
+=======================================
+Fecha: 2026-06-20
+Rama de trabajo: feature/morosos  (nueva, desde main)
 
 CONTEXTO
 --------
-Análisis del knowledge graph identificó tres problemas arquitecturales
-que no son bugs inmediatos pero degradan el sistema a medida que crece:
+Se agrega un módulo completo de gestión de fiados ("clientes morosos").
+No modifica tablas ni flujos existentes de ventas o productos, excepto
+por dos puntos de integración acotados:
 
-  1. refresh_all() indiscriminado  — re-lee toda la DB en cada acción
-  2. Sin capa de abstracción       — StockGui llama stock_app en ~40 puntos
-  3. ReportGenerator._config       — referencia frágil al dict de config
+  1. Agregar formas de pago nuevas al carrito (tarjetas + fiado).
+  2. Agregar una columna `recargo_pct` a `ventas` (migración v6).
 
-
-======================================================================
-MEJORA 1 — REFRESH SELECTIVO
-======================================================================
-
-Problema
---------
-refresh_all() ejecuta 6-7 queries + reconstruye todos los Treeviews
-en respuesta a CUALQUIER acción del usuario. Si el usuario está en la
-pestaña de precios (idx == 2), search_products() se llama DOS VECES
-(una en refresh_products y otra en refresh_price_table).
-
-Llamadas actuales a refresh_all() (~15 sitios):
-  - register_sale          - _undo / _redo
-  - _cobrar_carrito        - _apply_price_increase
-  - save_product (add)     - save_product (edit)
-  - delete_product         - _show_ajuste_stock (dialog OK)
-  - _add_product_supplier  - _set_primary_supplier
-  - _remove_supplier       - _import_boleta_csv
-
-Plan
-----
-Definir qué datos cambia cada operación y llamar solo lo necesario.
-Mantener refresh_all() solo para startup y botón "Actualizar lista".
-
-Mapa operación → refreshes necesarios:
-
-  | Operación                  | refresh_products | refresh_alerts | refresh_pending | caja/ventas_summary | refresh_dashboard | refresh_price_table | refresh_ventas |
-  |----------------------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-  | register_sale              |  ✓  |  ✓  |     |  ✓  |  ✓  |  si visible  |  si visible  |
-  | _cobrar_carrito            |  ✓  |  ✓  |     |  ✓  |  ✓  |  si visible  |  si visible  |
-  | save_product (add/edit)    |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
-  | delete_product             |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
-  | _apply_price_increase      |  ✓  |     |     |     |     |  si visible  |     |
-  | _show_ajuste_stock         |  ✓  |  ✓  |     |     |  ✓  |              |     |
-  | add_pending / del_pending  |     |     |  ✓  |     |  ✓  |              |     |
-  | _add/set/remove_supplier   |  ✓  |     |     |     |     |  si visible  |     |
-  | _import_boleta_csv         |  ✓  |  ✓  |     |     |  ✓  |  si visible  |     |
-  | _undo / _redo              | según tipo de acción deshecha/rehecha    |
-
-Implementación
---------------
-Agregar método auxiliar que solo refresca las pestañas opcionales si
-están visibles (evita el doble-query en precios):
-
-  def _refresh_visible_tabs(self) -> None:
-      idx = self._notebook.index("current")
-      if idx == 2:
-          self.refresh_price_table()
-      elif idx == 3:
-          self.refresh_ventas()
-
-Reemplazar cada refresh_all() con las llamadas específicas del mapa.
-Ejemplo para register_sale():
-
-  # ANTES
-  self.refresh_all()
-
-  # DESPUÉS
-  self.refresh_products()
-  self.refresh_alerts()
-  self._update_caja_y_ventas()   # caja_var + _update_ventas_summary
-  self._refresh_dashboard()
-  self._refresh_visible_tabs()
-
-Para _undo y _redo: el tipo de acción ya está disponible en el dict,
-así que se puede ramificar:
-
-  if action["type"] in ("sale", "redo_sale"):
-      self.refresh_products()
-      self.refresh_alerts()
-      self._update_caja_y_ventas()
-      self._refresh_dashboard()
-      self._refresh_visible_tabs()
-  elif action["type"] in ("delete_product", "redo_delete"):
-      self.refresh_products()
-      self.refresh_alerts()
-      self._refresh_dashboard()
-      self._refresh_visible_tabs()
-  elif action["type"] == "price_increase":
-      self.refresh_products()
-      self._refresh_visible_tabs()
-  elif action["type"].startswith("cart_"):
-      self._refresh_cart_display()   # ya existente, sin queries extra
+Todo lo demás es código nuevo.
 
 
 ======================================================================
-MEJORA 2 — CAPA DE SERVICIO (StockService)
+ANÁLISIS DE IMPACTO SOBRE EL CÓDIGO EXISTENTE
 ======================================================================
 
-Problema
---------
-StockGui llama directamente a stock_app.* en ~40 sitios, pasando
-self.conn en cada llamada. No hay un punto único de cambio cuando
-evoluciona la API de stock_app. Los tests de GUI deben conocer la
-implementación interna de stock_app para funcionar.
+Archivos que cambian:
+  stock_app.py   — migración v6, 6 funciones nuevas, 6 métodos en StockService
+  stock_gui.py   — _FORMAS_PAGO, _cobrar_carrito, register_sale,
+                   _refresh_cart_display, nueva pestaña, FiadoDialog,
+                   3 líneas en __init__
 
-Plan
-----
-Crear clase StockService en stock_app.py que encapsule las operaciones
-de negocio. StockGui pasa a usar self._svc en lugar de stock_app.*
+Archivos que NO cambian:
+  test_stock_app.py  — los tests existentes no se tocan (nuevos se agregan)
+  requirements.txt   — sin nuevas dependencias
 
-Clase a agregar al final de stock_app.py:
-
-  class StockService:
-      """Fachada de operaciones de negocio sobre una conexión SQLite."""
-
-      def __init__(self, conn: sqlite3.Connection) -> None:
-          self._conn = conn
-
-      # ── Productos ──────────────────────────────────────────────────
-      def buscar_productos(self, query: str = "") -> list[sqlite3.Row]:
-          return search_products(self._conn, query)
-
-      def obtener_producto(self, codigo: str) -> sqlite3.Row:
-          return get_product(self._conn, codigo)
-
-      def agregar_producto(self, codigo, nombre, precio, stock,
-                           stock_minimo, proveedor="", precio_costo=0.0,
-                           notas="") -> None:
-          add_product(self._conn, codigo, nombre, precio, stock,
-                      stock_minimo, proveedor, precio_costo, notas)
-
-      def actualizar_producto(self, codigo, nombre, precio, stock,
-                              stock_minimo, proveedor="", precio_costo=0.0,
-                              notas="", motivo="Edición manual") -> None:
-          update_product(self._conn, codigo, nombre, precio, stock,
-                         stock_minimo, proveedor, precio_costo, notas, motivo)
-
-      def eliminar_producto(self, codigo: str) -> dict:
-          """Elimina el producto y devuelve sus datos + proveedores para undo."""
-          product = get_product(self._conn, codigo)
-          data = {k: product[k] for k in product.keys()}
-          data["suppliers"] = [
-              {k: s[k] for k in s.keys()}
-              for s in get_product_suppliers(self._conn, codigo)
-          ]
-          delete_product(self._conn, codigo)
-          return data
-
-      def restaurar_producto(self, data: dict) -> None:
-          _restore_product(self._conn, data)
-
-      def stock_bajo(self) -> list[sqlite3.Row]:
-          return low_stock_products(self._conn)
-
-      def ajustar_stock(self, codigo: str, nuevo_stock: int) -> int:
-          return adjust_stock(self._conn, codigo, nuevo_stock)
-
-      # ── Ventas ─────────────────────────────────────────────────────
-      def vender(self, codigo: str, cantidad: int, forma_pago: str,
-                 allow_negative: bool = False,
-                 sale_date: date | None = None) -> tuple[float, int]:
-          return register_sale(self._conn, codigo, cantidad,
-                               allow_negative=allow_negative,
-                               sale_date=sale_date, forma_pago=forma_pago)
-
-      def revertir_venta(self, codigo, cantidad, total,
-                         sale_date, sale_id=None) -> None:
-          reverse_sale(self._conn, codigo, cantidad, total,
-                       sale_date, sale_id=sale_id)
-
-      def ventas_hoy(self, cash_date=None) -> list[sqlite3.Row]:
-          return get_ventas_hoy(self._conn, cash_date)
-
-      def resumen_diario(self, cash_date=None) -> dict:
-          return get_daily_summary(self._conn, cash_date)
-
-      # ── Precios ────────────────────────────────────────────────────
-      def aumento_masivo(self, codigos: list[str],
-                         pct: float) -> list[tuple]:
-          return bulk_price_increase(self._conn, codigos, pct)
-
-      def restaurar_precios(self, changes) -> None:
-          restore_prices(self._conn, changes)
-
-      def todos_los_proveedores(self) -> list[str]:
-          return get_all_proveedores(self._conn)
-
-      # ── Pendientes ─────────────────────────────────────────────────
-      def agregar_pendiente(self, descripcion: str) -> None:
-          add_pending(self._conn, descripcion)
-
-      def completar_pendiente(self, pid: int) -> bool:
-          return complete_pending(self._conn, pid)
-
-      def eliminar_pendiente(self, pid: int) -> bool:
-          return delete_pending(self._conn, pid)
-
-      def listar_pendientes(self) -> list[sqlite3.Row]:
-          return list_pending(self._conn)
-
-      # ── Caja ───────────────────────────────────────────────────────
-      def caja_hoy(self) -> float:
-          return daily_cash(self._conn)
-
-Cambios en StockGui
--------------------
-En __init__, reemplazar:
-  self.conn = stock_app.get_connection()
-  stock_app.initialize_database(self.conn)
-por:
-  self.conn = stock_app.get_connection()
-  stock_app.initialize_database(self.conn)
-  self._svc = stock_app.StockService(self.conn)
-
-Migrar llamadas de mayor impacto primero (por frecuencia de cambio):
-  stock_app.register_sale(self.conn, ...)       → self._svc.vender(...)
-  stock_app.delete_product(self.conn, codigo)   → self._svc.eliminar_producto(codigo)
-  stock_app.bulk_price_increase(self.conn, ...) → self._svc.aumento_masivo(...)
-  stock_app.add_product(self.conn, ...)         → self._svc.agregar_producto(...)
-  stock_app.update_product(self.conn, ...)      → self._svc.actualizar_producto(...)
-  stock_app.get_all_proveedores(self.conn)      → self._svc.todos_los_proveedores()
-
-La lógica de captura de datos para undo de eliminar_producto se mueve
-DENTRO de self._svc.eliminar_producto() — el GUI solo recibe el dict:
-
-  # ANTES (en stock_gui.py, ~10 líneas duplicadas en 2 lugares)
-  product = stock_app.get_product(self.conn, codigo)
-  undo_data = {k: product[k] for k in product.keys()}
-  undo_data["suppliers"] = [...]
-  stock_app.delete_product(self.conn, codigo)
-
-  # DESPUÉS (1 línea)
-  undo_data = self._svc.eliminar_producto(codigo)
-
-Nota: no hace falta migrar las 40 llamadas de una sola vez. Se puede
-hacer incrementalmente, priorizando las operaciones más complejas.
-Las llamadas simples de solo lectura (search_products, list_products,
-get_price_history, etc.) pueden mantenerse como están o migrarse
-en una segunda pasada.
+Puntos de integración:
+  - _FORMAS_PAGO: tupla de 3 → 5 elementos
+  - _cobrar_carrito: agrega rama para "Fiado" y cálculo de recargo tarjeta
+  - register_sale (GUI): agrega cálculo de recargo tarjeta
+  - StockGui.__init__: 3 líneas para aplicar recargos mensuales al arrancar
 
 
 ======================================================================
-MEJORA 3 — REPORTGENERATOR: ELIMINAR REFERENCIA FRÁGIL
+FASE 0 — CREAR RAMA
 ======================================================================
 
-Problema
---------
-ReportGenerator guarda self._config = config en __init__, que es una
-referencia al mismo dict que StockGui._config. Funciona hoy porque
-la config solo se muta (nunca se reasigna). Pero si alguien hace
-self._config = stock_app.load_config() para refrescar la config,
-ReportGenerator queda con datos viejos sin ninguna señal de error.
-
-Plan
-----
-ReportGenerator lee la config directamente de disco en cada generación.
-El archivo config.json es pequeño (~100 bytes) — el costo de leerlo
-una vez por PDF es despreciable.
-
-Cambio en ReportGenerator.__init__:
-
-  # ANTES
-  def __init__(self, conn: sqlite3.Connection, config: dict) -> None:
-      self._conn = conn
-      self._config = config
-
-  # DESPUÉS
-  def __init__(self, conn: sqlite3.Connection) -> None:
-      self._conn = conn
-
-Cambio en ReportGenerator.generate():
-
-  # ANTES
-  def generate(self, filepath: str, options: dict) -> None:
-      from fpdf import FPDF
-      pdf = FPDF()
-      ...
-      self._draw_header(pdf, self._config.get("nombre_negocio", "Reporte"))
-
-  # DESPUÉS
-  def generate(self, filepath: str, options: dict) -> None:
-      from fpdf import FPDF
-      config = stock_app.load_config()   # lee fresco en cada generación
-      pdf = FPDF()
-      ...
-      self._draw_header(pdf, config.get("nombre_negocio", "Reporte"))
-      # pasar config a los métodos que lo necesiten (_moneda, etc.)
-
-Adaptar _moneda y _draw_header para recibir config como parámetro
-en lugar de leerlo de self._config:
-
-  def _section_productos(self, pdf, moneda: str) -> None: ...
-  def _section_ventas(self, pdf, desde, hasta, moneda: str) -> None: ...
-
-Cambio en StockGui.__init__:
-
-  # ANTES
-  self._report_gen = ReportGenerator(self.conn, self._config)
-
-  # DESPUÉS
-  self._report_gen = ReportGenerator(self.conn)
-
-Con esto, StockGui ya no necesita pasar self._config al constructor —
-se elimina el acoplamiento entre el ciclo de vida del dict de config
-y el generador de PDF.
+  git checkout -b feature/morosos
 
 
 ======================================================================
-MEJORA 4 — ERRORES DE TIPOS PYLANCE (stock_gui.py)
+FASE 1 — SCHEMA v6 (stock_app.py)
 ======================================================================
 
-Son 4 errores reales y 1 warning de import. Todos en stock_gui.py.
+Cambiar _SCHEMA_VERSION de 5 a 6.
 
-──────────────────────────────────────────────────────────────────────
-Error A — Líneas 2031-2032: "date" is not assignable to "bool"
-──────────────────────────────────────────────────────────────────────
-Causa: en _generar_reporte_pdf(), el dict `options` se construye con
-4 valores bool (Pylance infiere dict[str, bool]). Luego se asignan
-claves "desde" y "hasta" de tipo date → conflicto de tipos.
+Agregar migración v5 → v6 en initialize_database():
 
-  # ANTES (línea 2017)
-  options = {
-      "productos": self._rep_productos_var.get(),   # bool
-      "ventas":    self._rep_ventas_var.get(),       # bool
-      "pendientes":self._rep_pendientes_var.get(),   # bool
-      "stock_bajo":self._rep_stock_bajo_var.get(),   # bool
-  }
-
-  # DESPUÉS — agregar anotación explícita
-  options: dict[str, Any] = {
-      "productos": self._rep_productos_var.get(),
-      "ventas":    self._rep_ventas_var.get(),
-      "pendientes":self._rep_pendientes_var.get(),
-      "stock_bajo":self._rep_stock_bajo_var.get(),
-  }
-
-`Any` ya está importado en la línea 9 del archivo.
-
-──────────────────────────────────────────────────────────────────────
-Errores B — Líneas 2591, 2592, 2606, 2609, 2610, 2615:
-           "cantidad"/"sale_date" is possibly unbound
-──────────────────────────────────────────────────────────────────────
-Causa: `cantidad` y `sale_date` se asignan dentro del bloque `try`.
-Pylance no puede inferir que en el handler de InsufficientStockError
-y en el código posterior, parse_int() ya tuvo que haber tenido éxito
-(porque si hubiera fallado con ValueError, habría entrado al último
-except y retornado). Desde el punto de vista estático, las variables
-podrían no estar asignadas.
-
-Estructura actual (simplificada):
-  try:
-      cantidad = parse_int(...)    # podría lanzar ValueError
-      sale_date = date.today()
-      total, sale_id = stock_app.register_sale(...)
-  except ProductNotFoundError:
-      return
-  except InsufficientStockError:
-      stock_app.register_sale(..., cantidad, ...)  # ← unbound?
-  except (ValueError, StockError):
-      return
-  # líneas 2603+: cantidad, sale_date usados ← unbound?
-
-Solución — separar la validación de entrada del intento de venta:
-
-  # DESPUÉS
-  try:
-      cantidad = parse_int(self.venta_cantidad_var.get(), "cantidad")
-  except (ValueError, stock_app.StockError) as exc:
-      messagebox.showerror("No se pudo registrar", str(exc))
-      return
-
-  sale_date = date.today()   # aquí cantidad ya está garantizada
-
-  try:
-      total, sale_id = stock_app.register_sale(
-          self.conn, codigo, cantidad, sale_date=sale_date,
-          forma_pago=forma_pago,
-      )
-  except stock_app.ProductNotFoundError:
-      if messagebox.askyesno(...):
-          self._start_add_product_with_code(codigo)
-      return
-  except stock_app.InsufficientStockError as exc:
-      allow = messagebox.askyesno(...)
-      if not allow:
-          return
-      try:
-          total, sale_id = stock_app.register_sale(
-              self.conn, codigo, cantidad, allow_negative=True,
-              sale_date=sale_date, forma_pago=forma_pago,
+  # 1. Columna recargo_pct en ventas
+  #    Guarda el porcentaje de recargo aplicado (15 para tarjetas, 0 para el resto).
+  #    Permite reconstruir "total sin recargo" en reportes futuros.
+  if current_version < 6:
+      if not _col_exists("ventas", "recargo_pct"):
+          conn.execute(
+              "ALTER TABLE ventas ADD COLUMN recargo_pct REAL NOT NULL DEFAULT 0"
           )
-      except (ValueError, stock_app.StockError) as retry_exc:
-          logger.exception("Error en venta con stock negativo")
-          messagebox.showerror("No se pudo registrar", str(retry_exc))
-          return
-  except stock_app.StockError as exc:
-      logger.exception("Error registrando venta")
-      messagebox.showerror("No se pudo registrar", str(exc))
-      return
 
-Con esto, `cantidad` y `sale_date` están garantizados antes de entrar
-al try de la venta — Pylance ya no reporta unbound.
+  # 2. Clientes morosos
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS clientes_morosos (
+          id      INTEGER PRIMARY KEY AUTOINCREMENT,
+          nombre  TEXT NOT NULL UNIQUE
+      )
+  """)
+
+  # 3. Deudas
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS deudas (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          cliente_id      INTEGER NOT NULL
+                          REFERENCES clientes_morosos(id) ON DELETE RESTRICT,
+          fecha_registro  TEXT NOT NULL,   -- ISO date
+          monto_original  REAL NOT NULL CHECK(monto_original > 0),
+          saldo_actual    REAL NOT NULL CHECK(saldo_actual >= 0),
+          estado          TEXT NOT NULL DEFAULT 'activa'
+                          CHECK(estado IN ('activa', 'saldada'))
+      )
+  """)
+
+  # 4. Productos incluidos en cada deuda (para mostrar detalle)
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS deuda_productos (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          deuda_id    INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+          codigo      TEXT NOT NULL,
+          nombre      TEXT NOT NULL,
+          cantidad    INTEGER NOT NULL,
+          precio_unit REAL NOT NULL
+      )
+  """)
+
+  # 5. Pagos (parciales o totales) registrados contra una deuda
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS pagos_deuda (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          deuda_id     INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+          fecha_pago   TEXT NOT NULL,
+          monto_pagado REAL NOT NULL CHECK(monto_pagado > 0)
+      )
+  """)
+
+  # 6. Recargos mensuales aplicados (historial + idempotencia)
+  conn.execute("""
+      CREATE TABLE IF NOT EXISTS recargos_deuda (
+          id               INTEGER PRIMARY KEY AUTOINCREMENT,
+          deuda_id         INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+          fecha_aplicacion TEXT NOT NULL,   -- ISO date del día 10 que disparó el recargo
+          porcentaje       REAL NOT NULL,
+          monto_recargo    REAL NOT NULL
+      )
+  """)
+
+  # 7. Índices útiles
+  conn.execute(
+      "CREATE INDEX IF NOT EXISTS idx_deudas_cliente ON deudas(cliente_id)"
+  )
+  conn.execute(
+      "CREATE INDEX IF NOT EXISTS idx_deudas_estado ON deudas(estado)"
+  )
+
+Nota sobre ON DELETE RESTRICT en deudas.cliente_id:
+  Se usa RESTRICT (no CASCADE) para que no se pueda borrar un cliente
+  que tenga deudas. Es más seguro que dejar filas de deudas sin cliente.
+  Si se quiere eliminar un cliente, primero hay que saldar/borrar sus deudas.
+
+
+======================================================================
+FASE 2 — FUNCIONES DE NEGOCIO (stock_app.py)
+======================================================================
+
+Constantes nuevas (al inicio del archivo, junto a _SCHEMA_VERSION):
+
+  _RECARGO_TARJETA_PCT = 15.0   # % sobre el total para tarjetas
+  _RECARGO_MORA_PCT    = 20.0   # % sobre saldo restante en corte mensual
 
 ──────────────────────────────────────────────────────────────────────
-Error C — Línea 3281: "Object of type 'object' is not callable"
+2.1  add_cliente_moroso(conn, nombre) → int
 ──────────────────────────────────────────────────────────────────────
-Causa: ConflictoDialog.__init__ tipea el parámetro on_complete
-como `object`, que no tiene __call__. Al hacer self._on_complete()
-en _finish(), Pylance lo rechaza.
+  INSERT OR IGNORE INTO clientes_morosos (nombre) VALUES (?)
+  Devuelve el id del cliente (existente o recién creado).
 
-  # ANTES (línea 3027)
-  on_complete: object,
+──────────────────────────────────────────────────────────────────────
+2.2  get_clientes_morosos(conn) → list[sqlite3.Row]
+──────────────────────────────────────────────────────────────────────
+  SELECT cm.id, cm.nombre, COUNT(d.id) AS deudas_activas,
+         COALESCE(SUM(d.saldo_actual), 0) AS total_adeudado
+  FROM clientes_morosos cm
+  LEFT JOIN deudas d ON d.cliente_id = cm.id AND d.estado = 'activa'
+  GROUP BY cm.id ORDER BY cm.nombre
 
-  # DESPUÉS
-  on_complete: Callable[[], None],
+──────────────────────────────────────────────────────────────────────
+2.3  add_deuda(conn, cliente_id, items, fecha) → int
+──────────────────────────────────────────────────────────────────────
+  items: list[dict] con claves codigo, nombre, cantidad, precio_unit
+         (misma estructura que self._cart)
 
-Agregar Callable al import de typing (línea 9):
+  Pasos dentro de with conn:
+    1. Calcular monto_original = sum(item["cantidad"] * item["precio_unit"])
+    2. INSERT INTO deudas (cliente_id, fecha_registro, monto_original, saldo_actual, estado)
+    3. Para cada item: INSERT INTO deuda_productos (deuda_id, codigo, nombre, cantidad, precio_unit)
+    4. Para cada item: descontar stock con UPDATE productos SET stock = stock - cantidad
+       (igual que register_sale pero sin crear fila en ventas ni en caja)
+    5. Devuelve deuda_id
 
+  Nota: no se crea registro en ventas ni en caja. El fiado no es
+  una venta cobrada — es una deuda. El stock sí se descuenta.
+
+──────────────────────────────────────────────────────────────────────
+2.4  get_deudas_cliente(conn, cliente_id) → list[sqlite3.Row]
+──────────────────────────────────────────────────────────────────────
+  SELECT d.*,
+         (SELECT json_group_array(json_object(
+             'nombre', dp.nombre,
+             'cantidad', dp.cantidad,
+             'precio_unit', dp.precio_unit
+         )) FROM deuda_productos dp WHERE dp.deuda_id = d.id) AS productos_json,
+         (SELECT COALESCE(SUM(p.monto_pagado), 0)
+          FROM pagos_deuda p WHERE p.deuda_id = d.id) AS total_pagado,
+         (SELECT COALESCE(SUM(r.monto_recargo), 0)
+          FROM recargos_deuda r WHERE r.deuda_id = d.id) AS total_recargos
+  FROM deudas d WHERE d.cliente_id = ?
+  ORDER BY d.fecha_registro DESC
+
+──────────────────────────────────────────────────────────────────────
+2.5  registrar_pago(conn, deuda_id, monto) → float
+──────────────────────────────────────────────────────────────────────
+  Validaciones:
+    - deuda debe existir y estar 'activa'
+    - monto > 0
+    - monto <= saldo_actual  (no se puede pagar más de lo adeudado)
+
+  Con with conn:
+    nuevo_saldo = saldo_actual - monto
+    INSERT INTO pagos_deuda (deuda_id, fecha_pago, monto_pagado)
+    UPDATE deudas SET saldo_actual = nuevo_saldo [, estado = 'saldada'] WHERE id = ?
+    Si nuevo_saldo == 0: estado → 'saldada'
+
+  Devuelve nuevo_saldo.
+
+──────────────────────────────────────────────────────────────────────
+2.6  saldar_deuda(conn, deuda_id) → None
+──────────────────────────────────────────────────────────────────────
+  Registra un pago por el saldo_actual completo y marca la deuda como
+  saldada. Llama internamente a registrar_pago(conn, deuda_id, saldo_actual).
+
+──────────────────────────────────────────────────────────────────────
+2.7  aplicar_recargo(conn, deuda_id, porcentaje, fecha_corte) → bool
+──────────────────────────────────────────────────────────────────────
+  Aplica un recargo a una deuda activa. Es IDEMPOTENTE: si ya existe
+  un registro en recargos_deuda con deuda_id y fecha_aplicacion =
+  fecha_corte, no hace nada y devuelve False.
+
+  Si no existe:
+    monto_recargo = round(saldo_actual * porcentaje / 100, 2)
+    UPDATE deudas SET saldo_actual = saldo_actual + monto_recargo
+    INSERT INTO recargos_deuda (deuda_id, fecha_aplicacion, porcentaje, monto_recargo)
+    Devuelve True.
+
+──────────────────────────────────────────────────────────────────────
+2.8  aplicar_recargos_mensuales(conn) → int
+──────────────────────────────────────────────────────────────────────
+  Se llama al iniciar la app. Devuelve la cantidad de deudas cargadas.
+
+  Regla de elegibilidad (fecha_corte = hoy si hoy.day == 10):
+    Si hoy NO es día 10 → retorna 0 inmediatamente.
+    Si hoy ES día 10:
+      fecha_corte = hoy.isoformat()
+      primer_dia_mes = date(hoy.year, hoy.month, 1).isoformat()
+
+      SELECT deudas donde:
+        estado = 'activa'
+        fecha_registro < fecha_corte    -- excluye deudas del día 10 de hoy
+        fecha_registro >= primer_dia_mes -- excluye deudas de meses anteriores
+                                         -- que ya recibieron su recargo
+
+  Esperar un momento: la regla es más compleja. Veamos ejemplos:
+
+    Deuda del 8-enero → recargo el 10-enero ✓
+    Deuda del 10-enero → recargo el 10-febrero ✗ (no en enero)
+    Deuda del 17-enero → recargo el 10-febrero ✓
+    Deuda del 8-enero, no saldada → recargo el 10-febrero también ✓
+
+  La regla general para el corte del día 10 del mes M:
+    Recibe recargo si:
+      estado = 'activa'
+      fecha_registro < fecha del día 10 del mes M
+      NO tiene ya un recargo con fecha_aplicacion = día 10 del mes M
+
+  La condición `fecha_registro < 10-del-mes-M` excluye automáticamente
+  las deudas creadas ese mismo día o después. Y el check de idempotencia
+  en aplicar_recargo() evita doble aplicación.
+
+  Implementación:
+
+    if date.today().day != 10:
+        return 0
+
+    fecha_corte = date.today().isoformat()
+    deudas = conn.execute(
+        """
+        SELECT id, saldo_actual FROM deudas
+        WHERE estado = 'activa' AND fecha_registro < ?
+        AND NOT EXISTS (
+            SELECT 1 FROM recargos_deuda
+            WHERE deuda_id = deudas.id AND fecha_aplicacion = ?
+        )
+        """,
+        (fecha_corte, fecha_corte),
+    ).fetchall()
+
+    count = 0
+    for deuda in deudas:
+        aplicar_recargo(conn, deuda["id"], _RECARGO_MORA_PCT, fecha_corte)
+        count += 1
+    return count
+
+Nota: el NOT EXISTS en el query + la idempotencia en aplicar_recargo()
+dan doble protección. Si la app se reinicia dos veces el día 10, el
+segundo arranque no aplica recargos duplicados.
+
+
+======================================================================
+FASE 3 — MÉTODOS EN StockService (stock_app.py)
+======================================================================
+
+Agregar en la clase StockService:
+
+  # ── Morosos ─────────────────────────────────────────────────────────
+  def add_cliente_moroso(self, nombre: str) -> int:
+      return add_cliente_moroso(self._conn, nombre)
+
+  def get_clientes_morosos(self) -> list[sqlite3.Row]:
+      return get_clientes_morosos(self._conn)
+
+  def add_deuda(self, cliente_id: int, items: list[dict], fecha: date) -> int:
+      return add_deuda(self._conn, cliente_id, items, fecha)
+
+  def get_deudas_cliente(self, cliente_id: int) -> list[sqlite3.Row]:
+      return get_deudas_cliente(self._conn, cliente_id)
+
+  def registrar_pago(self, deuda_id: int, monto: float) -> float:
+      return registrar_pago(self._conn, deuda_id, monto)
+
+  def saldar_deuda(self, deuda_id: int) -> None:
+      saldar_deuda(self._conn, deuda_id)
+
+  def aplicar_recargos_mensuales(self) -> int:
+      return aplicar_recargos_mensuales(self._conn)
+
+
+======================================================================
+FASE 4 — FORMAS DE PAGO Y RECARGO TARJETA (stock_gui.py)
+======================================================================
+
+──────────────────────────────────────────────────────────────────────
+4.1  Constante _FORMAS_PAGO (línea 14)
+──────────────────────────────────────────────────────────────────────
   # ANTES
-  from typing import Any
+  _FORMAS_PAGO = ("Efectivo", "Transferencia", "Tarjeta")
 
   # DESPUÉS
-  from typing import Any, Callable
+  _FORMAS_PAGO = ("Efectivo", "Transferencia", "Tarjeta de credito", "Tarjeta de debito", "Fiado")
+  _RECARGO_TARJETA_PCT = 15.0
+  _FORMAS_CON_RECARGO = {"Tarjeta de credito", "Tarjeta de debito"}
 
 ──────────────────────────────────────────────────────────────────────
-Warning D — Línea 2044: Import "fpdf" could not be resolved
+4.2  Helper privado de módulo
 ──────────────────────────────────────────────────────────────────────
-Causa: fpdf2 no tiene stubs de tipos. El import es intencional (sirve
-para detectar si la librería está instalada antes de generar el PDF).
+  def _calcular_recargo(forma_pago: str, subtotal: float) -> float:
+      """Devuelve el monto de recargo (0 si no aplica)."""
+      if forma_pago in _FORMAS_CON_RECARGO:
+          return round(subtotal * _RECARGO_TARJETA_PCT / 100, 2)
+      return 0.0
 
-  # ANTES (línea 2044)
-  import fpdf  # noqa: F401
+──────────────────────────────────────────────────────────────────────
+4.3  _refresh_cart_display: mostrar recargo cuando aplica
+──────────────────────────────────────────────────────────────────────
+  Actualmente solo muestra "Total: $X.XX".
+  Con tarjeta: "Total: $X.XX  (+15% tarjeta: $Y.YY)"
 
-  # DESPUÉS
-  import fpdf  # type: ignore[import-untyped]  # noqa: F401
+  def _refresh_cart_display(self) -> None:
+      clear_table(self._cart_table)
+      subtotal = 0.0
+      for item in self._cart:
+          ...  # igual que antes
+          subtotal += item["subtotal"]
 
-Esto silencia el warning de Pylance sin cambiar el comportamiento.
+      forma_pago = self._venta_forma_pago_var.get()
+      recargo = _calcular_recargo(forma_pago, subtotal)
+      total_final = subtotal + recargo
+
+      if recargo > 0:
+          self._cart_total_var.set(
+              f"Total: ${total_final:.2f}  (+{_RECARGO_TARJETA_PCT:.0f}% tarjeta: ${recargo:.2f})"
+          )
+      else:
+          self._cart_total_var.set(f"Total: ${total_final:.2f}")
+
+  También agregar trace en __init__ (junto a los otros traces, ~línea 302):
+      self._venta_forma_pago_var.trace_add("write", lambda *_: self._refresh_cart_display())
+
+──────────────────────────────────────────────────────────────────────
+4.4  _cobrar_carrito: rama Fiado + recargo tarjeta
+──────────────────────────────────────────────────────────────────────
+  Al inicio de _cobrar_carrito, ANTES del loop:
+
+    forma_pago = self._venta_forma_pago_var.get() or "Efectivo"
+
+    # Rama fiado: no cobra, abre modal
+    if forma_pago == "Fiado":
+        self._abrir_modal_fiado()
+        return
+
+  Dentro del loop, al calcular el total de cada ítem, agregar recargo:
+
+    # ANTES: total ya viene de self._svc.vender()
+    # El recargo se agrega ENCIMA del precio unitario en la venta final.
+    # register_sale almacena total = precio * cantidad.
+    # El recargo es un cargo adicional al comprador, no cambia el precio
+    # del producto. Se almacena como campo separado (recargo_pct en ventas).
+
+    total, sale_id = self._svc.vender(
+        item["codigo"], item["cantidad"],
+        sale_date=sale_date, forma_pago=forma_pago,
+    )
+    # Agregar recargo al total registrado
+    recargo_pct = _RECARGO_TARJETA_PCT if forma_pago in _FORMAS_CON_RECARGO else 0.0
+    # Si hay recargo, ajustar la venta para guardar el total real:
+    # stock_app.register_sale no sabe del recargo → se registra como
+    # una fila adicional de "recargo" o se actualiza el total en ventas.
+
+  ↑ DECISIÓN DE DISEÑO PARA EL REGISTRO DEL RECARGO EN VENTAS:
+  Opción A (recomendada): register_sale acepta recargo_pct y lo aplica al total.
+    Ventaja: total en DB = lo que realmente pagó el cliente.
+    Cambio: agregar parámetro recargo_pct a register_sale en stock_app.py.
+    total almacenado = precio_unit * cantidad * (1 + recargo_pct/100)
+
+  Opción B: guardar total sin recargo y recargo_pct separado.
+    Ventaja: se puede distinguir siempre el precio base del recargo.
+    Complejidad: los reportes de caja tienen que sumar (total + total*pct).
+
+  → Se usa Opción A: el total en ventas ya incluye el recargo. El campo
+    recargo_pct en ventas permite reconstruir el precio base si se necesita.
+
+  En register_sale (stock_app.py), agregar parámetro:
+    recargo_pct: float = 0.0
+    total = float(product["precio"]) * cantidad * (1 + recargo_pct / 100)
+    ...almacenar recargo_pct en la fila de ventas
+
+──────────────────────────────────────────────────────────────────────
+4.5  register_sale (GUI, método de StockGui): recargo y fiado en venta individual
+──────────────────────────────────────────────────────────────────────
+  En el método register_sale de StockGui (~línea 2555):
+
+  - Si forma_pago in _FORMAS_CON_RECARGO: pasar recargo_pct al _svc.vender()
+
+  - Si forma_pago == "Fiado":
+      Construir la lista de ítems con el único producto:
+        product = self._svc.obtener_producto(codigo)
+        items = [{
+            "codigo":     codigo,
+            "nombre":     product["nombre"],
+            "cantidad":   cantidad,
+            "precio_unit": float(product["precio"]),
+        }]
+      Abrir FiadoDialog(self, items, on_confirm=self._registrar_fiado)
+      return  (no continuar con el flujo normal de venta)
+
+
+======================================================================
+FASE 5 — FiadoDialog (stock_gui.py)
+======================================================================
+
+Clase nueva FiadoDialog, similar en estructura a ConflictoDialog.
+
+Función: el usuario selecciona (o crea) un cliente moroso y confirma.
+Al confirmar: se llama a self._parent._registrar_fiado(cliente_id).
+
+──────────────────────────────────────────────────────────────────────
+Diseño del modal
+──────────────────────────────────────────────────────────────────────
+  FiadoDialog recibe items: list[dict] (uno o varios productos).
+  El mismo modal sirve tanto para venta individual como para carrito.
+
+  Título: "Registrar fiado"
+  Contenido:
+    [Label] Total a fiar: $XXX.XX
+    [Label] Cliente:
+    [Entry buscador] (filtra la lista en tiempo real)
+    [Listbox] clientes existentes (con o sin deuda activa)
+    [Button] + Nuevo cliente
+    [Separator]
+    [Button: Confirmar fiado]  [Button: Cancelar]
+
+  Al hacer clic en "+ Nuevo cliente":
+    simpledialog.askstring("Nuevo cliente", "Nombre del cliente:")
+    → si no existe: self._svc.add_cliente_moroso(nombre)
+    → seleccionar automáticamente el cliente recién creado en la lista
+
+  Al confirmar:
+    self._on_confirm(cliente_id, self._items)
+    self._dialog.destroy()
+
+──────────────────────────────────────────────────────────────────────
+_registrar_fiado(self, cliente_id, items, desde_carrito=False) en StockGui
+──────────────────────────────────────────────────────────────────────
+  deuda_id = self._svc.add_deuda(cliente_id, items, date.today())
+
+  if desde_carrito:
+      self._cart.clear()
+      self._refresh_cart_display()
+  else:
+      # Limpiar campos de venta individual (igual que después de una venta normal)
+      self.venta_codigo_var.set("")
+      self.venta_cantidad_var.set("1")
+      self._venta_codigo_entry.focus_set()
+
+  self._refresh_after_product_change()   # stock se descontó
+
+  total = sum(i["cantidad"] * i["precio_unit"] for i in items)
+  logger.info("Fiado registrado: cliente_id %d, deuda_id %d, $%.2f", cliente_id, deuda_id, total)
+  self._set_status(f"Fiado registrado - Total: ${total:.2f}")
+
+Invocación desde carrito (_cobrar_carrito):
+  FiadoDialog(self, items=self._cart, on_confirm=lambda cid, its: self._registrar_fiado(cid, its, desde_carrito=True))
+
+Invocación desde venta individual (register_sale):
+  FiadoDialog(self, items=items, on_confirm=lambda cid, its: self._registrar_fiado(cid, its, desde_carrito=False))
+
+
+======================================================================
+FASE 6 — PESTAÑA "CLIENTES MOROSOS" (stock_gui.py)
+======================================================================
+
+Agregar como última pestaña del notebook (índice 5 o el que corresponda).
+
+──────────────────────────────────────────────────────────────────────
+Vista principal: lista de clientes con deuda activa
+──────────────────────────────────────────────────────────────────────
+  Treeview con columnas:
+    nombre | deudas activas | total adeudado
+
+  Botones:
+    [Ver detalle]  (o doble clic en la fila)
+    [Actualizar lista]
+
+  Al abrir la pestaña → refresh automático (igual que otras pestañas).
+
+──────────────────────────────────────────────────────────────────────
+Vista de detalle: popup por cliente
+──────────────────────────────────────────────────────────────────────
+  Toplevel con:
+    Título: "Deudas de {nombre}"
+
+    Por cada deuda (lista con Treeview o Frame scrollable):
+      Fecha registro | Monto original | Total recargos | Pagado | Saldo | Estado
+
+    Al seleccionar una deuda: panel de detalle inferior con:
+      Productos:
+        nombre x cantidad @ $precio_unit = $subtotal (cada fila)
+
+      Historial (recargos + pagos mezclados, ordenados por fecha):
+        [fecha] Recargo 20%  +$XXX.XX   → rojo
+        [fecha] Pago parcial -$XXX.XX   → verde
+        Total recargos acumulados: $XXX.XX
+
+      Desglose final:
+        Monto original:  $XXX.XX
+        + Recargos:      $XXX.XX
+        - Pagado:        $XXX.XX
+        = Saldo actual:  $XXX.XX
+
+      Acciones:
+        [Registrar pago parcial]  → pide monto, llama registrar_pago()
+        [Marcar como saldada]     → llama saldar_deuda(), confirma antes
+
+──────────────────────────────────────────────────────────────────────
+_refresh_after_moroso_change()
+──────────────────────────────────────────────────────────────────────
+  Nuevo helper de refresh, igual que los existentes:
+  Solo refresca la tabla de clientes morosos si la pestaña está visible.
+
+  También agregar "morosos" al _refresh_visible_tabs():
+    elif idx == 5:   # o el índice real de la pestaña
+        self.refresh_morosos()
+
+
+======================================================================
+FASE 7 — ARRANQUE CON RECARGOS MENSUALES (stock_gui.py)
+======================================================================
+
+En StockGui.__init__, DESPUÉS del backup silencioso (línea ~317):
+
+  # Recargos mensuales (día 10 de cada mes)
+  try:
+      n = self._svc.aplicar_recargos_mensuales()
+      if n > 0:
+          logger.info("Recargos mensuales aplicados a %d deuda(s)", n)
+  except Exception:
+      pass
+
+Si la app se abre el día 10, el usuario ve un log INFO que indica cuántas
+deudas recibieron recargo. No hay popup ni interrupción visual.
+
+
+======================================================================
+CAMBIOS A register_sale EN stock_app.py
+======================================================================
+
+Firma actual:
+  def register_sale(conn, codigo, cantidad, allow_negative=False,
+                    sale_date=None, forma_pago="Efectivo") -> tuple[float, int]
+
+Firma nueva:
+  def register_sale(conn, codigo, cantidad, allow_negative=False,
+                    sale_date=None, forma_pago="Efectivo",
+                    recargo_pct: float = 0.0) -> tuple[float, int]
+
+Cambio interno:
+  total = float(product["precio"]) * cantidad * (1 + recargo_pct / 100)
+
+  En el INSERT de ventas agregar recargo_pct:
+  conn.execute(
+      """INSERT INTO ventas
+         (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo, recargo_pct)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+      (..., recargo_pct),
+  )
+
+También actualizar StockService.vender() para aceptar y pasar recargo_pct.
 
 
 ======================================================================
 ORDEN DE IMPLEMENTACIÓN
 ======================================================================
 
-  0. Mejora 4 (errores Pylance) — correcciones de tipos, sin lógica
-     Empezar por aquí: son los cambios más seguros y rápidos.
-  1. Mejora 3 (ReportGenerator) — cambio acotado, sin tests que romper
-  2. Mejora 1 (refresh selectivo) — mayor impacto en UX, riesgo medio
-     Verificar manualmente que cada flujo actualiza las vistas correctas
-  3. Mejora 2 (StockService) — migración incremental
-     Empezar por las operaciones de escritura (vender, eliminar, agregar)
-     Dejar las lecturas simples para una segunda pasada
+  1. Migración v6 en stock_app.py
+     (_SCHEMA_VERSION = 6, tablas morosos, columna recargo_pct en ventas)
+     → verificar: python -m unittest -v (89 tests deben pasar)
+
+  2. register_sale: agregar recargo_pct (stock_app.py + StockService)
+     → parámetro con default=0.0, sin romper tests existentes
+
+  3. Funciones de negocio de morosos (Fase 2: 8 funciones)
+     → agregar tests unitarios para cada una
+     → probar add_deuda descuenta stock correctamente
+     → probar aplicar_recargos_mensuales es idempotente
+
+  4. Formas de pago + recargo tarjeta en GUI (Fase 4)
+     → probar: seleccionar "Tarjeta de credito" → carrito muestra recargo
+     → probar: cobrar con tarjeta → ventas.recargo_pct = 15
+
+  5. FiadoDialog + _registrar_fiado (Fase 5)
+     → probar: fiado vacía el carrito, descuenta stock, crea deuda
+
+  6. Pestaña Clientes Morosos (Fase 6)
+     → probar: ver cliente, ver deudas, pago parcial, saldar
+
+  7. Recargos al arrancar (Fase 7)
+     → probar: crear deuda anterior al día 10, simular arranque en día 10,
+       verificar recargo aplicado y que no se duplica en segundo arranque
 
 
 ======================================================================
-VERIFICACIÓN
+VERIFICACIÓN COMPLETA
 ======================================================================
 
-Después de cada mejora:
-  python -m unittest test_stock_app -v
-  → Los 89 tests deben seguir pasando
+Tests a agregar (test_stock_app.py):
+  test_add_cliente_moroso_idempotente
+  test_add_deuda_descuenta_stock
+  test_registrar_pago_reduce_saldo
+  test_registrar_pago_excesivo_rechazado
+  test_saldar_deuda_marca_saldada
+  test_aplicar_recargo_idempotente
+  test_recargos_mensuales_solo_dia_10
+  test_recargos_mensuales_excluye_deudas_del_dia
+  test_recargos_mensuales_incluye_deudas_mes_anterior_activas
+  test_register_sale_con_recargo_tarjeta
 
-Flujos manuales a verificar para Mejora 1 (refresh selectivo):
-  - Registrar venta → tabla de productos actualiza stock
-  - Agregar producto → aparece en tabla sin reiniciar la app
-  - Aumento masivo de precios → tabla de precios actualiza si está visible
-  - Agregar pendiente → tabla de pendientes actualiza
-  - Dashboard refleja el estado correcto después de cada operación
-  - Undo/redo de venta → stock vuelve al valor anterior
+Flujos manuales:
+  - Agregar producto → ir a carrito → seleccionar "Tarjeta de credito"
+    → verificar que el total muestra recargo antes de cobrar
+  - Cobrar con tarjeta → verificar en ventas.recargo_pct = 15
+  - Seleccionar "Fiado" → modal → crear nuevo cliente → confirmar
+    → verificar stock descontado, deuda creada, carrito vacío
+  - Pestaña morosos → ver cliente → ver deuda → pago parcial → saldo correcto
+  - Pago parcial mayor al saldo → rechazado con mensaje de error
+  - Saldar deuda → ya no aparece en deudas activas del cliente
+  - Abrir app el día 10 con deuda activa del día 8 → log muestra 1 recargo
+  - Cerrar y reabrir la misma app el día 10 → log no muestra recargos (idempotente)
 
-Flujos para Mejora 2 (StockService):
-  - Eliminar producto → undo → producto restaurado con proveedores
-  - Mismos flujos de venta, edición y precio
 
-Flujo para Mejora 3 (ReportGenerator):
-  - Cambiar nombre del negocio en configuración
-  - Generar PDF → el encabezado muestra el nombre nuevo (no el viejo)
+======================================================================
+DECISIONES DE DISEÑO REGISTRADAS
+======================================================================
+
+| Decisión | Motivo |
+|---|---|
+| Fiado disponible desde carrito y venta individual | FiadoDialog recibe una lista de ítems; en venta individual la lista tiene un solo elemento. El flujo de confirmación es idéntico. |
+| Fiado no crea fila en ventas | No es una venta cobrada; se gestiona en el módulo de deudas para no mezclar caja con crédito. |
+| Stock se descuenta en fiado | Los productos salen físicamente del local; el stock debe reflejarlo. |
+| total en ventas incluye recargo tarjeta | La caja refleja el dinero realmente recibido. recargo_pct permite auditoría. |
+| Recargo mora = día 10 de cada mes | Condición de negocio fija; corre al abrir la app (igual que el backup). |
+| Idempotencia del recargo mensual | La app puede abrirse varias veces el día 10; no se duplican recargos. |
+| ON DELETE RESTRICT en deudas.cliente_id | Evita borrar clientes con deudas activas accidentalmente. |
+| Monto original inmutable | Los recargos y pagos se registran en tablas separadas; el monto_original nunca cambia. |
