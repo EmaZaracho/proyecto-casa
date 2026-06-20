@@ -5,7 +5,7 @@ Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de 
 ## Estado actual
 
 - Rama principal: `main`. Refactorizacion tecnica completa mergeada.
-- Base de datos local SQLite con migraciones hasta schema v5.
+- Base de datos local SQLite con migraciones hasta schema v6.
 - GUI Tkinter con textos visibles en ASCII para evitar problemas de codificacion en Windows.
 - Proveedores normalizados en `proveedores_producto`; `productos.proveedor` y `productos.precio_costo` quedan como cache del proveedor principal.
 - SQLite abre con `PRAGMA foreign_keys=ON` y `PRAGMA journal_mode=WAL`.
@@ -14,7 +14,7 @@ Aplicacion de escritorio en Python para gestion de inventario, ventas y caja de 
 - Undo/redo esta encapsulado en `UndoManager`.
 - Generacion de PDF esta encapsulada en `ReportGenerator`, que lee config fresca al generar.
 - Las acciones de la GUI usan refresh selectivo para evitar recargar vistas no afectadas.
-- Suite actual: 89 tests con `unittest`.
+- Suite actual: 102 tests con `unittest`.
 
 ## Requisitos
 
@@ -54,7 +54,9 @@ En la primera ejecucion la app crea automaticamente:
 - Busqueda de productos por codigo, nombre y proveedor.
 - Alertas de stock bajo y sin stock.
 - Registro de ventas individuales y ventas por carrito.
-- Formas de pago: `Efectivo`, `Transferencia`, `Tarjeta`.
+- Formas de pago: `Efectivo`, `Transferencia`, `Tarjeta de credito`, `Tarjeta de debito`, `Fiado`.
+- Recargo del 15 % aplicado automaticamente en ventas con tarjeta (visible en carrito antes de cobrar).
+- Fiado: las ventas marcadas como "Fiado" no entran a caja; se registran como deuda del cliente y descontancstock.
 - Caja diaria con total, desglose por forma de pago y ganancia bruta.
 - Historial de cambios de precio con motivo.
 - Aumento masivo de precios con vista previa y undo.
@@ -75,13 +77,22 @@ codigo,nombre,cantidad,precio_costo,precio_venta
 - Backup automatico diario del archivo de base de datos.
 - Deshacer y rehacer con `Ctrl+Z` / `Ctrl+Y`, hasta 10 pasos.
 
+### Clientes Morosos
+
+- Pestana "Clientes Morosos" con listado de clientes y total adeudado.
+- Alta de cliente moroso desde la pestana o desde el flujo de venta.
+- Registro de deuda (fiado): descuenta stock pero no registra en caja ni en ventas.
+- Historial por deuda: pagos y recargos por fecha.
+- Registro de pagos parciales o totales desde el popup de detalle.
+- Recargo mensual del 20 % aplicado automaticamente el dia 10 de cada mes a todas las deudas activas anteriores al corte (idempotente: no se aplica dos veces el mismo dia).
+
 ## Pruebas
 
 ```powershell
 python -m unittest -v
 ```
 
-Estado actual: 89 tests pasan.
+Estado actual: 102 tests pasan.
 
 Nota: `pytest` no es requisito del proyecto. Si se quiere usar el comando del plan:
 

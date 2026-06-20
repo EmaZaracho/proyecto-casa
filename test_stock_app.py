@@ -923,5 +923,131 @@ class StockGuiTests(unittest.TestCase):
         self.assertEqual(stock_app.list_pending(self.test_conn), [])
 
 
+class MorososTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "test.db"
+        self.conn = stock_app.get_connection(self.db_path)
+        stock_app.initialize_database(self.conn)
+        stock_app.add_product(self.conn, "P01", "Yerba", 500, 10, 1)
+        stock_app.add_product(self.conn, "P02", "Azucar", 200, 5, 1)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _items(self, cantidad=2):
+        return [{"codigo": "P01", "nombre": "Yerba", "cantidad": cantidad, "precio_unit": 500}]
+
+    # ── clientes ──────────────────────────────────────────────────────────────
+
+    def test_add_cliente_moroso_idempotente(self):
+        id1 = stock_app.add_cliente_moroso(self.conn, "Juan")
+        id2 = stock_app.add_cliente_moroso(self.conn, "Juan")
+        self.assertEqual(id1, id2)
+
+    def test_add_cliente_moroso_nombre_vacio_falla(self):
+        with self.assertRaises(stock_app.StockError):
+            stock_app.add_cliente_moroso(self.conn, "   ")
+
+    # ── deudas ────────────────────────────────────────────────────────────────
+
+    def test_add_deuda_descuenta_stock(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Ana")
+        stock_app.add_deuda(self.conn, cid, self._items(cantidad=3), date.today())
+        prod = stock_app.get_product(self.conn, "P01")
+        self.assertEqual(prod["stock"], 7)
+
+    def test_add_deuda_calcula_monto_original(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Pedro")
+        deuda_id = stock_app.add_deuda(self.conn, self.conn.execute(
+            "SELECT id FROM clientes_morosos WHERE nombre='Pedro'"
+        ).fetchone()["id"] if False else cid,
+            self._items(cantidad=2), date.today())
+        deudas = stock_app.get_deudas_cliente(self.conn, cid)
+        self.assertEqual(len(deudas), 1)
+        self.assertAlmostEqual(float(deudas[0]["monto_original"]), 1000.0)
+
+    # ── pagos ─────────────────────────────────────────────────────────────────
+
+    def test_registrar_pago_reduce_saldo(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Maria")
+        did = stock_app.add_deuda(self.conn, cid, self._items(), date.today())
+        nuevo_saldo = stock_app.registrar_pago(self.conn, did, 400)
+        self.assertAlmostEqual(nuevo_saldo, 600.0)
+        deuda = stock_app.get_deudas_cliente(self.conn, cid)[0]
+        self.assertAlmostEqual(float(deuda["saldo_actual"]), 600.0)
+        self.assertEqual(deuda["estado"], "activa")
+
+    def test_registrar_pago_excesivo_rechazado(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Luis")
+        did = stock_app.add_deuda(self.conn, cid, self._items(), date.today())
+        with self.assertRaises(stock_app.StockError):
+            stock_app.registrar_pago(self.conn, did, 9999)
+
+    def test_registrar_pago_exacto_marca_saldada(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Rosa")
+        did = stock_app.add_deuda(self.conn, cid, self._items(), date.today())
+        stock_app.registrar_pago(self.conn, did, 1000)
+        deuda = stock_app.get_deudas_cliente(self.conn, cid)[0]
+        self.assertEqual(deuda["estado"], "saldada")
+
+    # ── saldar ────────────────────────────────────────────────────────────────
+
+    def test_saldar_deuda_marca_saldada(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Carlos")
+        did = stock_app.add_deuda(self.conn, cid, self._items(), date.today())
+        stock_app.registrar_pago(self.conn, did, 300)
+        stock_app.saldar_deuda(self.conn, did)
+        deuda = stock_app.get_deudas_cliente(self.conn, cid)[0]
+        self.assertEqual(deuda["estado"], "saldada")
+        self.assertAlmostEqual(float(deuda["saldo_actual"]), 0.0)
+
+    # ── recargos ──────────────────────────────────────────────────────────────
+
+    def test_aplicar_recargo_idempotente(self):
+        cid = stock_app.add_cliente_moroso(self.conn, "Tomas")
+        did = stock_app.add_deuda(self.conn, cid, self._items(), date.today())
+        fecha_corte = "2026-01-10"
+        r1 = stock_app.aplicar_recargo(self.conn, did, 20, fecha_corte)
+        r2 = stock_app.aplicar_recargo(self.conn, did, 20, fecha_corte)
+        self.assertTrue(r1)
+        self.assertFalse(r2)
+        deuda = stock_app.get_deudas_cliente(self.conn, cid)[0]
+        self.assertAlmostEqual(float(deuda["saldo_actual"]), 1200.0)
+
+    def test_recargos_mensuales_solo_dia_10(self):
+        from unittest.mock import patch
+        cid = stock_app.add_cliente_moroso(self.conn, "Hector")
+        stock_app.add_deuda(self.conn, cid, self._items(), date(2026, 1, 1))
+        with patch("stock_app.date") as mock_date:
+            mock_date.today.return_value = date(2026, 1, 15)
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            n = stock_app.aplicar_recargos_mensuales(self.conn)
+        self.assertEqual(n, 0)
+
+    def test_recargos_mensuales_incluye_deudas_mes_anterior_activas(self):
+        from unittest.mock import patch
+        cid = stock_app.add_cliente_moroso(self.conn, "Sofia")
+        stock_app.add_deuda(self.conn, cid, self._items(), date(2026, 1, 5))
+        with patch("stock_app.date") as mock_date:
+            mock_date.today.return_value = date(2026, 1, 10)
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            n = stock_app.aplicar_recargos_mensuales(self.conn)
+        self.assertEqual(n, 1)
+
+    # ── register_sale con recargo ─────────────────────────────────────────────
+
+    def test_register_sale_con_recargo_tarjeta(self):
+        total, _ = stock_app.register_sale(
+            self.conn, "P01", 1, recargo_pct=15.0, forma_pago="Tarjeta de credito"
+        )
+        self.assertAlmostEqual(total, 575.0)
+
+    def test_register_sale_sin_recargo(self):
+        total, _ = stock_app.register_sale(self.conn, "P01", 1)
+        self.assertAlmostEqual(total, 500.0)
+
+
 if __name__ == "__main__":
     unittest.main()
