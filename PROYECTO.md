@@ -18,9 +18,9 @@ App de escritorio para gestion de inventario y punto de venta de un negocio pequ
 
 ## Estado actual
 
-- Rama principal: `main`. Refactorizacion tecnica completa mergeada desde `prueba-de-refactorizacion`.
-- Schema actual: v5.
-- Tests actuales: 89 con `python -m unittest -v`.
+- Rama principal: `main`. Modulo morosos implementado en `feature/morosos` (rama activa).
+- Schema actual: v6.
+- Tests actuales: 102 con `python -m unittest -v`.
 - `pytest` no esta instalado por defecto.
 - Textos visibles de la GUI normalizados a ASCII para evitar mojibake en Windows.
 - Refactor tecnico aplicado:
@@ -114,7 +114,7 @@ Decisiones:
 
 `initialize_database()` usa tabla `schema_version` y aplica migraciones idempotentes.
 
-Version actual: v5.
+Version actual: v6.
 
 | Migracion | Cambio |
 |---|---|
@@ -123,17 +123,23 @@ Version actual: v5.
 | v2 -> v3 | `precio_costo` en `ventas` |
 | v3 -> v4 | indices para ventas, nombre de producto y proveedor |
 | v4 -> v5 | tabla `proveedores_producto` y migracion de proveedor existente |
+| v5 -> v6 | modulo morosos: 5 tablas nuevas + columna `recargo_pct` en `ventas` |
 
 ### Tablas
 
 ```sql
 productos
-ventas
+ventas              -- agrega recargo_pct en v6
 caja
 historial_precios
 pendientes
 schema_version
 proveedores_producto
+clientes_morosos    -- v6
+deudas              -- v6
+deuda_productos     -- v6
+pagos_deuda         -- v6
+recargos_deuda      -- v6
 ```
 
 `productos.proveedor` y `productos.precio_costo` se mantienen como cache del proveedor principal para no romper consultas existentes. La fuente normalizada de proveedores es `proveedores_producto`.
@@ -206,6 +212,17 @@ Decision actual: `proveedor` en el CSV es opcional. Si no viene o esta vacio, `p
 - Venta individual y carrito.
 - Alertas de stock bajo.
 - Pendientes internos.
+- Formas de pago expandidas: Efectivo, Transferencia, Tarjeta de credito, Tarjeta de debito, Fiado.
+- Recargo automatico del 15 % en ventas con tarjeta (mostrado en carrito antes de cobrar).
+
+### Clientes Morosos (v6)
+
+- Pestana dedicada con listado de clientes, deudas activas y total adeudado.
+- Fiado registrable desde venta individual o desde carrito.
+- La deuda descuenta stock pero no entra a caja ni a ventas.
+- Pagos parciales o totales por deuda, con historial de movimientos.
+- Recargo mensual del 20 % el dia 10 de cada mes (idempotente via NOT EXISTS).
+- Clientes con `ON DELETE RESTRICT` para evitar borrado accidental con deudas activas.
 
 ### Gestion de precios
 
@@ -281,6 +298,11 @@ Los errores criticos siguen usando `logger.exception()`.
 | Margen sobre precio de venta | Convencion actual del negocio. |
 | Fechas UI `DD-MM-AAAA`, DB ISO | UI amigable y DB ordenable. |
 | Carrito activo por defecto | Flujo habitual del negocio. |
+| Fiado no genera fila en ventas ni en caja | El fiado no es una venta cobrada; su seguimiento vive en el modulo morosos. |
+| `ON DELETE RESTRICT` en `deudas.cliente_id` | Previene borrar un cliente con deudas activas sin resolver primero las deudas. |
+| Recargo mensual idempotente (NOT EXISTS) | Permite relanzar la app en el dia 10 sin duplicar recargos. |
+| Recargo tarjeta sobre total del carrito, visible antes de cobrar | El usuario debe ver el costo real antes de confirmar la venta. |
+| `recargo_pct` guardado en `ventas` | Permite auditar si una venta tuvo recargo sin recalcular a posteriori. |
 
 ## Funciones clave en stock_app.py
 
@@ -307,6 +329,13 @@ Los errores criticos siguen usando `logger.exception()`.
 | `apply_boleta_batch()` | Aplica lote de boleta. |
 | `get_range_summary()` | Resumen de ventas por rango. |
 | `load_config()` / `save_config()` | Configuracion runtime. |
+| `add_cliente_moroso()` | Crea cliente moroso si no existe (idempotente). |
+| `add_deuda()` | Registra deuda, descuenta stock, NO toca caja ni ventas. |
+| `get_deudas_cliente()` | Lista deudas de un cliente con totales de pagos y recargos. |
+| `registrar_pago()` | Pago parcial o total de una deuda; marca saldada si saldo = 0. |
+| `saldar_deuda()` | Cierra la deuda completando el saldo restante. |
+| `aplicar_recargo()` | Aplica recargo a una deuda (idempotente por fecha_corte). |
+| `aplicar_recargos_mensuales()` | Aplica recargo del dia 10 a todas las deudas activas elegibles. |
 
 ## Tests
 
@@ -318,14 +347,16 @@ python -m unittest -v
 
 Estado actual:
 
-- 89 tests pasan.
+- 102 tests pasan.
 - Tests de GUI corren solo si hay display disponible.
-- Cobertura nueva incluye cascade de proveedores, restore sin merge accidental, proveedores duplicados, promocion de secundario y proveedor por defecto en boleta.
+- Cobertura nueva incluye cascade de proveedores, restore sin merge accidental, proveedores duplicados, promocion de secundario, proveedor por defecto en boleta, y modulo morosos (clientes, deudas, pagos, recargos, recargos mensuales, register_sale con recargo_pct).
 
 ## Pendientes / ideas
 
 - El filtro por proveedor en la tabla de precios sigue mostrando el proveedor principal; podria extenderse para filtrar tambien por proveedores secundarios.
 - Tests dependientes de `date.today()` pueden ser fragiles cerca de medianoche.
 - Agregar ticket post-venta sin cambio de schema.
-- Agregar notas por venta con schema v6 (`ventas.notas`).
+- Agregar notas por venta (`ventas.notas`) con schema v7.
 - Comparacion de periodos en reportes PDF.
+- Incluir deudas fiadas en el reporte PDF como seccion propia.
+- Exportar historial de morosos a CSV.

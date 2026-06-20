@@ -11,7 +11,21 @@ from typing import Any, Callable
 import stock_app
 
 _UNDO_MAX = 10
-_FORMAS_PAGO = ("Efectivo", "Transferencia", "Tarjeta")
+_FORMAS_PAGO = (
+    "Efectivo",
+    "Transferencia",
+    "Tarjeta de credito",
+    "Tarjeta de debito",
+    "Fiado",
+)
+_FORMAS_CON_RECARGO: frozenset[str] = frozenset({"Tarjeta de credito", "Tarjeta de debito"})
+_RECARGO_TARJETA_PCT = stock_app._RECARGO_TARJETA_PCT
+
+
+def _calcular_recargo(forma_pago: str, subtotal: float) -> float:
+    if forma_pago in _FORMAS_CON_RECARGO:
+        return round(subtotal * _RECARGO_TARJETA_PCT / 100, 2)
+    return 0.0
 
 _COLORS_LIGHT = dict(
     bg="#f0f0f0", bg_widget="#ffffff", fg="#000000", fg_muted="gray",
@@ -286,11 +300,11 @@ class StockGui(tk.Tk):
         self._init_historial_vars()
         self._init_ventas_vars()
 
-        # â”€â”€ sorting state â”€â”€
+        # â"€â"€ sorting state â"€â"€
         self._sort_col: str = ""
         self._sort_asc: bool = True
 
-        # â”€â”€ state â”€â”€
+        # â"€â"€ state â"€â"€
         self._edit_mode = False
         self._edit_codigo: str | None = None
         self._form_visible = False
@@ -302,6 +316,7 @@ class StockGui(tk.Tk):
         self.search_var.trace_add("write", lambda *_: self.refresh_products())
         self._hist_search_var.trace_add("write", lambda *_: self._refresh_price_history())
         self.venta_codigo_var.trace_add("write", lambda *_: self._update_producto_preview())
+        self._venta_forma_pago_var.trace_add("write", lambda *_: self._refresh_cart_display())
         self.refresh_all()
         self.bind("<Control-z>", lambda _: self._undo())
         self.bind("<Control-y>", lambda _: self._redo())
@@ -314,6 +329,14 @@ class StockGui(tk.Tk):
         # silent daily backup
         try:
             self._svc.backup()
+        except Exception:
+            pass
+
+        # apply monthly surcharge if today is day 10
+        try:
+            n = self._svc.aplicar_recargos_mensuales()
+            if n > 0:
+                logger.info("Recargos mensuales aplicados a %d deuda(s)", n)
         except Exception:
             pass
 
@@ -419,12 +442,14 @@ class StockGui(tk.Tk):
         tab3 = ttk.Frame(self._notebook, padding=6)
         tab4 = ttk.Frame(self._notebook, padding=6)
         tab5 = ttk.Frame(self._notebook, padding=6)
+        tab6 = ttk.Frame(self._notebook, padding=6)
         self._notebook.add(tab0, text="  Resumen  ")
         self._notebook.add(tab1, text="  Principal  ")
         self._notebook.add(tab2, text="  Gestion de precios  ")
         self._notebook.add(tab3, text="  Ventas del dia  ")
         self._notebook.add(tab4, text="  Historial de precios  ")
         self._notebook.add(tab5, text="  Reportes  ")
+        self._notebook.add(tab6, text="  Clientes Morosos  ")
 
         self._build_tab_dashboard(tab0)
         self._build_tab_principal(tab1)
@@ -432,6 +457,7 @@ class StockGui(tk.Tk):
         self._build_tab_ventas(tab3)
         self._build_tab_historial(tab4)
         self._build_tab_reportes(tab5)
+        self._build_tab_morosos(tab6)
 
         status_bar = ttk.Label(
             outer, textvariable=self._status_var,
@@ -441,7 +467,7 @@ class StockGui(tk.Tk):
 
         self._apply_theme()
 
-    # â”€â”€ Tab 0 â€” Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€ Tab 0 â€" Dashboard â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_dashboard(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(0, weight=1)
@@ -546,7 +572,7 @@ class StockGui(tk.Tk):
                 values=(p["codigo"], p["nombre"], p["stock"]),
             )
 
-    # â”€â”€ Tab 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€ Tab 1 â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_principal(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=2)
@@ -587,14 +613,14 @@ class StockGui(tk.Tk):
         for col in range(8):
             self._product_form_frame.columnconfigure(col, weight=1)
 
-        # row 0 â€” labels
+        # row 0 â€" labels
         for col, text in enumerate(
             ("Codigo", "Nombre", "", "Precio", "P.Costo", "Stock", "Minimo", "Proveedor")
         ):
             if text:
                 ttk.Label(self._product_form_frame, text=text).grid(row=0, column=col, sticky="w")
 
-        # row 1 â€” entries
+        # row 1 â€" entries
         self._codigo_entry = ttk.Entry(self._product_form_frame, textvariable=self.codigo_var)
         self._codigo_entry.grid(row=1, column=0, sticky="ew", padx=(0, 4))
 
@@ -620,12 +646,12 @@ class StockGui(tk.Tk):
         self._proveedor_combo.bind("<ButtonPress>", lambda _: self._refresh_form_proveedor())
         self._proveedor_combo.bind("<FocusIn>", lambda _: self._refresh_form_proveedor())
 
-        # row 2 â€” second row labels
+        # row 2 â€" second row labels
         ttk.Label(self._product_form_frame, text="Notas").grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
 
-        # row 3 â€” notas + actions
+        # row 3 â€" notas + actions
         ttk.Entry(self._product_form_frame, textvariable=self.notas_var).grid(
             row=3, column=0, columnspan=6, sticky="ew", padx=(0, 4)
         )
@@ -892,7 +918,7 @@ class StockGui(tk.Tk):
         )
         ttk.Button(btn_row, text="Refrescar", command=self.refresh_pending).grid(row=0, column=3)
 
-    # â”€â”€ Tab 2: price management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€ Tab 2: price management â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_precios(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -976,7 +1002,7 @@ class StockGui(tk.Tk):
         ).grid(row=0, column=5, padx=(0, 8))
         ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=6, sticky="e")
 
-    # â”€â”€ Tab 4: price history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€ Tab 4: price history â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_historial(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -1031,13 +1057,13 @@ class StockGui(tk.Tk):
                 f"${ant:.2f}", f"${nvo:.2f}", cambio, row["motivo"],
             ))
 
-    # â”€â”€ Tab 3: sales of the day â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â"€â"€ Tab 3: sales of the day â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_ventas(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        # â”€â”€ date navigation + summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ date navigation + summary â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         nav_frame = ttk.Frame(parent)
         nav_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         nav_frame.columnconfigure(4, weight=1)
@@ -1055,7 +1081,7 @@ class StockGui(tk.Tk):
             font=("Segoe UI", 11, "bold"),
         ).grid(row=0, column=4, sticky="e")
 
-        # â”€â”€ date range filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ date range filter â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         range_frame = ttk.Frame(parent)
         range_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(range_frame, text="Rango - Desde:").grid(row=0, column=0, padx=(0, 4))
@@ -1073,7 +1099,7 @@ class StockGui(tk.Tk):
             row=0, column=5
         )
 
-        # â”€â”€ ventas table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ ventas table â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         self._ventas_table_frame = ttk.LabelFrame(parent, text="Ventas", padding=8)
         self._ventas_table_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
         self._ventas_table_frame.rowconfigure(0, weight=1)
@@ -1099,13 +1125,13 @@ class StockGui(tk.Tk):
         self.ventas_table.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
 
-        # â”€â”€ total footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ total footer â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         ttk.Label(parent, textvariable=self._ventas_total_var,
                   font=("Segoe UI", 10, "bold")).grid(
             row=3, column=0, sticky="e", pady=(0, 4)
         )
 
-        # â”€â”€ buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ buttons â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         btn_row = ttk.Frame(parent)
         btn_row.grid(row=4, column=0, sticky="ew")
         btn_row.columnconfigure(0, weight=1)
@@ -1156,6 +1182,8 @@ class StockGui(tk.Tk):
             self.refresh_ventas()
         elif idx == 4:
             self._refresh_price_history()
+        elif idx == 6:
+            self.refresh_morosos()
 
     # =========================================================================
     # Ventas por fecha
@@ -1612,7 +1640,7 @@ class StockGui(tk.Tk):
 
     def _refresh_cart_display(self) -> None:
         clear_table(self._cart_table)
-        total = 0.0
+        subtotal = 0.0
         for item in self._cart:
             self._cart_table.insert(
                 "", "end",
@@ -1623,8 +1651,16 @@ class StockGui(tk.Tk):
                     f"${item['subtotal']:.2f}",
                 ),
             )
-            total += item["subtotal"]
-        self._cart_total_var.set(f"Total: ${total:.2f}")
+            subtotal += item["subtotal"]
+        forma_pago = self._venta_forma_pago_var.get()
+        recargo = _calcular_recargo(forma_pago, subtotal)
+        total = round(subtotal + recargo, 2)
+        if recargo > 0:
+            self._cart_total_var.set(
+                f"Subtotal: ${subtotal:.2f}  +  Recargo: ${recargo:.2f}  =  Total: ${total:.2f}"
+            )
+        else:
+            self._cart_total_var.set(f"Total: ${total:.2f}")
 
     def _remove_from_cart(self) -> None:
         selected = self._cart_table.selection()
@@ -1662,6 +1698,25 @@ class StockGui(tk.Tk):
             return
 
         forma_pago = self._venta_forma_pago_var.get() or "Efectivo"
+
+        if forma_pago == "Fiado":
+            items = [
+                {
+                    "codigo": i["codigo"],
+                    "nombre": i["nombre"],
+                    "cantidad": i["cantidad"],
+                    "precio_unit": i["precio_unit"],
+                }
+                for i in self._cart
+            ]
+            FiadoDialog(
+                self,
+                items=items,
+                on_confirm=lambda cid: self._registrar_fiado(cid, items, desde_carrito=True),
+            )
+            return
+
+        recargo_pct = _RECARGO_TARJETA_PCT if forma_pago in _FORMAS_CON_RECARGO else 0.0
         errors: list[str] = []
         processed: list[dict] = []
         sale_date = date.today()
@@ -1671,6 +1726,7 @@ class StockGui(tk.Tk):
                 total, sale_id = self._svc.vender(
                     item["codigo"], item["cantidad"],
                     sale_date=sale_date, forma_pago=forma_pago,
+                    recargo_pct=recargo_pct,
                 )
                 processed.append({
                     **item,
@@ -1946,7 +2002,82 @@ class StockGui(tk.Tk):
         n = self._svc.exportar_productos_csv(Path(filepath))
         self._set_status(f"Exportados {n} productos a {Path(filepath).name}")
 
-    # â”€â”€ Tab 5: reportes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Tab 6: Clientes Morosos ───────────────────────────────────────────────
+
+    def _build_tab_morosos(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(parent)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(top, text="Actualizar", command=self.refresh_morosos).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Label(top, text="Lista de clientes con deuda activa o historial de fiado").pack(
+            side="left"
+        )
+
+        cols = ("Nombre", "Deudas activas", "Total adeudado")
+        self._morosos_tree = ttk.Treeview(
+            parent, columns=cols, show="headings", selectmode="browse"
+        )
+        for c in cols:
+            self._morosos_tree.heading(c, text=c)
+        self._morosos_tree.column("Nombre", width=220)
+        self._morosos_tree.column("Deudas activas", width=120, anchor="center")
+        self._morosos_tree.column("Total adeudado", width=140, anchor="e")
+        self._morosos_tree.grid(row=1, column=0, sticky="nsew")
+        self._morosos_tree.bind("<Double-Button-1>", lambda _: self._ver_detalle_moroso())
+
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(btn_row, text="Ver detalle", command=self._ver_detalle_moroso).pack(
+            side="left"
+        )
+        ttk.Button(btn_row, text="Nuevo cliente", command=self._nuevo_cliente_moroso).pack(
+            side="left", padx=(6, 0)
+        )
+
+    def refresh_morosos(self) -> None:
+        if not hasattr(self, "_morosos_tree"):
+            return
+        clear_table(self._morosos_tree)
+        for c in self._svc.listar_clientes_morosos():
+            self._morosos_tree.insert(
+                "", "end",
+                values=(
+                    c["nombre"],
+                    c["deudas_activas"],
+                    f"${float(c['total_adeudado']):.2f}",
+                ),
+                iid=str(c["id"]),
+            )
+
+    def _nuevo_cliente_moroso(self) -> None:
+        nombre = simpledialog.askstring("Nuevo cliente", "Nombre del cliente:")
+        if not nombre or not nombre.strip():
+            return
+        try:
+            self._svc.agregar_cliente_moroso(nombre.strip())
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+        self.refresh_morosos()
+
+    def _ver_detalle_moroso(self) -> None:
+        sel = self._morosos_tree.selection()
+        if not sel:
+            messagebox.showerror("Sin seleccion", "Selecciona un cliente.")
+            return
+        cliente_id = int(sel[0])
+        nombre = self._morosos_tree.item(sel[0], "values")[0]
+        MorosoDetalleDialog(self, cliente_id, nombre)
+
+    def _refresh_after_moroso_change(self) -> None:
+        if self._notebook.index("current") == 6:
+            self.refresh_morosos()
+
+    # â"€â"€ Tab 5: reportes â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     def _build_tab_reportes(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1960,13 +2091,13 @@ class StockGui(tk.Tk):
         sec_frame.grid(row=1, column=0, sticky="ew")
         sec_frame.columnconfigure(1, weight=1)
 
-        # â”€â”€ Productos â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ Productos â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         ttk.Checkbutton(
             sec_frame, text="Todos los productos",
             variable=self._rep_productos_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # â”€â”€ Ventas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ Ventas â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         ventas_cb = ttk.Checkbutton(
             sec_frame, text="Ventas",
             variable=self._rep_ventas_var,
@@ -1990,19 +2121,19 @@ class StockGui(tk.Tk):
         hint_lbl.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(2, 10))
         self._muted_labels.append(hint_lbl)
 
-        # â”€â”€ Pendientes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ Pendientes â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         ttk.Checkbutton(
             sec_frame, text="Pendientes",
             variable=self._rep_pendientes_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # â”€â”€ Stock bajo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ Stock bajo â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         ttk.Checkbutton(
             sec_frame, text="Stock bajo",
             variable=self._rep_stock_bajo_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w")
 
-        # â”€â”€ BotÃ³n generar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â"€â"€ BotÃ³n generar â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         btn_row = ttk.Frame(parent)
         btn_row.grid(row=2, column=0, sticky="e", pady=(18, 0))
         ttk.Button(
@@ -2559,10 +2690,35 @@ class StockGui(tk.Tk):
             messagebox.showerror("No se pudo registrar", str(exc))
             return
 
+        if forma_pago == "Fiado":
+            try:
+                producto = self._svc.obtener_producto(codigo)
+            except stock_app.ProductNotFoundError:
+                if messagebox.askyesno(
+                    "Producto no encontrado",
+                    f"No existe ningun producto con codigo '{codigo}'.\n\nQueres agregarlo ahora?",
+                ):
+                    self._start_add_product_with_code(codigo)
+                return
+            items = [{
+                "codigo": producto["codigo"],
+                "nombre": producto["nombre"],
+                "cantidad": cantidad,
+                "precio_unit": float(producto["precio"]),
+            }]
+            FiadoDialog(
+                self,
+                items=items,
+                on_confirm=lambda cid: self._registrar_fiado(cid, items, desde_carrito=False),
+            )
+            return
+
+        recargo_pct = _RECARGO_TARJETA_PCT if forma_pago in _FORMAS_CON_RECARGO else 0.0
         sale_date = date.today()
         try:
             total, sale_id = self._svc.vender(
-                codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago
+                codigo, cantidad, sale_date=sale_date, forma_pago=forma_pago,
+                recargo_pct=recargo_pct,
             )
         except stock_app.ProductNotFoundError:
             if messagebox.askyesno(
@@ -2582,6 +2738,7 @@ class StockGui(tk.Tk):
                 total, sale_id = self._svc.vender(
                     codigo, cantidad, allow_negative=True,
                     sale_date=sale_date, forma_pago=forma_pago,
+                    recargo_pct=recargo_pct,
                 )
             except (ValueError, stock_app.StockError) as retry_exc:
                 logger.exception("Error en venta con stock negativo")
@@ -2607,6 +2764,33 @@ class StockGui(tk.Tk):
         logger.info("Venta: %s x%d $%.2f", codigo, cantidad, total)
         self._set_status(f"Venta registrada [{forma_pago}] - Total: ${total:.2f}")
         self._venta_codigo_entry.focus_set()
+
+    def _registrar_fiado(
+        self,
+        cliente_id: int,
+        items: list[dict],
+        desde_carrito: bool = False,
+    ) -> None:
+        try:
+            self._svc.registrar_deuda(cliente_id, items, date.today())
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error al registrar fiado", str(exc))
+            return
+        if desde_carrito:
+            self._cart.clear()
+            self._refresh_cart_display()
+        else:
+            self.venta_codigo_var.set("")
+            self.venta_cantidad_var.set("1")
+        self._refresh_after_sale()
+        clientes = self._svc.listar_clientes_morosos()
+        cliente = next((c for c in clientes if c["id"] == cliente_id), None)
+        nombre = cliente["nombre"] if cliente else f"cliente #{cliente_id}"
+        total_deuda = sum(float(i["cantidad"]) * float(i["precio_unit"]) for i in items)
+        logger.info("Fiado registrado para '%s': $%.2f", nombre, total_deuda)
+        self._set_status(f"Fiado registrado para {nombre} - Total: ${total_deuda:.2f}")
+        if hasattr(self, "_morosos_tree"):
+            self.refresh_morosos()
 
     # =========================================================================
     # Pending
@@ -2660,6 +2844,8 @@ class StockGui(tk.Tk):
             self.refresh_price_table()
         elif idx == 3:
             self.refresh_ventas()
+        elif idx == 6:
+            self.refresh_morosos()
 
     def _update_caja_y_ventas(self) -> None:
         self.caja_var.set(f"Caja de hoy: ${self._svc.caja_hoy():.2f}")
@@ -3368,6 +3554,240 @@ def _date_to_ui(d: date) -> str:
 
 def _date_from_ui(s: str) -> date:
     return datetime.strptime(s.strip(), "%d-%m-%Y").date()
+
+
+class FiadoDialog:
+    """Selecciona o crea un cliente moroso para registrar una deuda fiado."""
+
+    def __init__(
+        self,
+        parent: StockGui,
+        items: list[dict],
+        on_confirm: Callable[[int], None],
+    ) -> None:
+        self._parent = parent
+        self._items = items
+        self._on_confirm = on_confirm
+        self._svc = parent._svc
+
+        self._dlg = tk.Toplevel(parent)
+        self._dlg.title("Registrar Fiado")
+        self._dlg.resizable(False, False)
+        self._dlg.grab_set()
+
+        outer = ttk.Frame(self._dlg, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Selecciona el cliente o crea uno nuevo:").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._filter())
+        ttk.Entry(outer, textvariable=self._search_var, width=30).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4)
+        )
+
+        self._listbox = tk.Listbox(outer, height=8, width=34)
+        self._listbox.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 6))
+        self._listbox.bind("<Double-Button-1>", lambda _: self._confirmar())
+
+        btn_frame = ttk.Frame(outer)
+        btn_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+        ttk.Button(btn_frame, text="Nuevo cliente", command=self._nuevo_cliente).pack(
+            side="left"
+        )
+        ttk.Button(btn_frame, text="Confirmar", command=self._confirmar).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(btn_frame, text="Cancelar", command=self._dlg.destroy).pack(
+            side="right"
+        )
+
+        self._clientes: list[sqlite3.Row] = self._svc.listar_clientes_morosos()
+        self._mostrar(self._clientes)
+
+    def _filter(self) -> None:
+        q = self._search_var.get().lower()
+        filtrados = [c for c in self._clientes if q in c["nombre"].lower()]
+        self._mostrar(filtrados)
+
+    def _mostrar(self, rows: list) -> None:
+        self._listbox.delete(0, "end")
+        self._filtered: list = list(rows)
+        for c in self._filtered:
+            adeudado = float(c["total_adeudado"])
+            tag = f" (${adeudado:.2f} adeudado)" if adeudado > 0 else ""
+            self._listbox.insert("end", f"{c['nombre']}{tag}")
+
+    def _nuevo_cliente(self) -> None:
+        nombre = simpledialog.askstring(
+            "Nuevo cliente", "Nombre del cliente:", parent=self._dlg
+        )
+        if not nombre or not nombre.strip():
+            return
+        try:
+            cid = self._svc.agregar_cliente_moroso(nombre.strip())
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error", str(exc), parent=self._dlg)
+            return
+        self._clientes = self._svc.listar_clientes_morosos()
+        self._mostrar(self._clientes)
+        self._dlg.destroy()
+        self._on_confirm(cid)
+
+    def _confirmar(self) -> None:
+        sel = self._listbox.curselection()
+        if not sel:
+            messagebox.showerror(
+                "Sin seleccion", "Selecciona un cliente de la lista.", parent=self._dlg
+            )
+            return
+        cliente = self._filtered[sel[0]]
+        self._dlg.destroy()
+        self._on_confirm(int(cliente["id"]))
+
+
+class MorosoDetalleDialog:
+    """Popup de detalle de un cliente moroso: deudas, pagos y recargos."""
+
+    def __init__(self, parent: StockGui, cliente_id: int, nombre: str) -> None:
+        self._parent = parent
+        self._cliente_id = cliente_id
+        self._svc = parent._svc
+
+        self._dlg = tk.Toplevel(parent)
+        self._dlg.title(f"Deudas de {nombre}")
+        self._dlg.geometry("700x500")
+        self._dlg.grab_set()
+
+        outer = ttk.Frame(self._dlg, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        ttk.Label(outer, text=f"Cliente: {nombre}", font=("", 11, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+
+        cols = ("Fecha", "Monto original", "Saldo actual", "Estado")
+        self._tree = ttk.Treeview(outer, columns=cols, show="headings", selectmode="browse")
+        for c in cols:
+            self._tree.heading(c, text=c)
+        self._tree.column("Fecha", width=100)
+        self._tree.column("Monto original", width=130, anchor="e")
+        self._tree.column("Saldo actual", width=130, anchor="e")
+        self._tree.column("Estado", width=80, anchor="center")
+        self._tree.grid(row=1, column=0, sticky="nsew")
+        self._tree.bind("<<TreeviewSelect>>", lambda _: self._load_historial())
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=2, column=0, sticky="ew", pady=(8, 4))
+        ttk.Button(btn_row, text="Registrar pago", command=self._registrar_pago).pack(
+            side="left"
+        )
+        ttk.Button(btn_row, text="Saldar deuda", command=self._saldar).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(btn_row, text="Cerrar", command=self._dlg.destroy).pack(side="right")
+
+        ttk.Label(outer, text="Historial (pagos y recargos):").grid(
+            row=3, column=0, sticky="w"
+        )
+        hist_cols = ("Fecha", "Tipo", "Monto", "Porcentaje")
+        self._hist_tree = ttk.Treeview(
+            outer, columns=hist_cols, show="headings", height=5
+        )
+        for c in hist_cols:
+            self._hist_tree.heading(c, text=c)
+        self._hist_tree.column("Fecha", width=100)
+        self._hist_tree.column("Tipo", width=80, anchor="center")
+        self._hist_tree.column("Monto", width=100, anchor="e")
+        self._hist_tree.column("Porcentaje", width=90, anchor="center")
+        self._hist_tree.grid(row=4, column=0, sticky="nsew", pady=(2, 0))
+
+        self._load_deudas()
+
+    def _load_deudas(self) -> None:
+        for iid in self._tree.get_children():
+            self._tree.delete(iid)
+        deudas = self._svc.deudas_cliente(self._cliente_id)
+        for d in deudas:
+            self._tree.insert(
+                "", "end",
+                iid=str(d["id"]),
+                values=(
+                    d["fecha_registro"],
+                    f"${float(d['monto_original']):.2f}",
+                    f"${float(d['saldo_actual']):.2f}",
+                    d["estado"],
+                ),
+            )
+
+    def _load_historial(self) -> None:
+        sel = self._tree.selection()
+        for iid in self._hist_tree.get_children():
+            self._hist_tree.delete(iid)
+        if not sel:
+            return
+        deuda_id = int(sel[0])
+        for ev in self._svc.historial_deuda(deuda_id):
+            pct = f"{ev['porcentaje']:.0f}%" if ev["porcentaje"] else ""
+            self._hist_tree.insert(
+                "", "end",
+                values=(ev["fecha"], ev["tipo"], f"${float(ev['monto']):.2f}", pct),
+            )
+
+    def _get_selected_deuda_id(self) -> int | None:
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showerror(
+                "Sin seleccion", "Selecciona una deuda de la lista.", parent=self._dlg
+            )
+            return None
+        return int(sel[0])
+
+    def _registrar_pago(self) -> None:
+        deuda_id = self._get_selected_deuda_id()
+        if deuda_id is None:
+            return
+        monto_str = simpledialog.askstring(
+            "Registrar pago", "Monto a pagar ($):", parent=self._dlg
+        )
+        if not monto_str:
+            return
+        try:
+            monto = float(monto_str.replace(",", "."))
+            nuevo_saldo = self._svc.pagar_deuda(deuda_id, monto)
+        except (ValueError, stock_app.StockError) as exc:
+            messagebox.showerror("Error", str(exc), parent=self._dlg)
+            return
+        self._load_deudas()
+        self._load_historial()
+        messagebox.showinfo(
+            "Pago registrado",
+            f"Pago de ${monto:.2f} registrado. Saldo restante: ${nuevo_saldo:.2f}",
+            parent=self._dlg,
+        )
+        self._parent.refresh_morosos()
+
+    def _saldar(self) -> None:
+        deuda_id = self._get_selected_deuda_id()
+        if deuda_id is None:
+            return
+        if not messagebox.askyesno(
+            "Saldar deuda", "Esto marcara la deuda como saldada. Continuar?",
+            parent=self._dlg,
+        ):
+            return
+        try:
+            self._svc.saldar_deuda(deuda_id)
+        except stock_app.StockError as exc:
+            messagebox.showerror("Error", str(exc), parent=self._dlg)
+            return
+        self._load_deudas()
+        self._load_historial()
+        self._parent.refresh_morosos()
 
 
 def main() -> None:

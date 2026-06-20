@@ -78,7 +78,10 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
+
+_RECARGO_TARJETA_PCT = 15.0   # % aplicado a ventas con tarjeta
+_RECARGO_MORA_PCT    = 20.0   # % aplicado a deudas activas en el corte mensual
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -226,6 +229,74 @@ def initialize_database(conn: sqlite3.Connection) -> None:
                     """,
                     (row["codigo"], row["proveedor"], row["precio_costo"]),
                 )
+
+    # v5 → v6: morosos module + recargo_pct on ventas
+    if current_version < 6:
+        if not _col_exists("ventas", "recargo_pct"):
+            conn.execute(
+                "ALTER TABLE ventas ADD COLUMN recargo_pct REAL NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clientes_morosos (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deudas (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id     INTEGER NOT NULL
+                               REFERENCES clientes_morosos(id) ON DELETE RESTRICT,
+                fecha_registro TEXT NOT NULL,
+                monto_original REAL NOT NULL CHECK(monto_original > 0),
+                saldo_actual   REAL NOT NULL CHECK(saldo_actual >= 0),
+                estado         TEXT NOT NULL DEFAULT 'activa'
+                               CHECK(estado IN ('activa', 'saldada'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deuda_productos (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                deuda_id    INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+                codigo      TEXT NOT NULL,
+                nombre      TEXT NOT NULL,
+                cantidad    INTEGER NOT NULL,
+                precio_unit REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pagos_deuda (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                deuda_id     INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+                fecha_pago   TEXT NOT NULL,
+                monto_pagado REAL NOT NULL CHECK(monto_pagado > 0)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recargos_deuda (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                deuda_id         INTEGER NOT NULL REFERENCES deudas(id) ON DELETE CASCADE,
+                fecha_aplicacion TEXT NOT NULL,
+                porcentaje       REAL NOT NULL,
+                monto_recargo    REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deudas_cliente ON deudas(cliente_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deudas_estado ON deudas(estado)"
+        )
 
     # update stored version
     if current_version == 0:
@@ -750,6 +821,7 @@ def register_sale(
     allow_negative: bool = False,
     sale_date: date | None = None,
     forma_pago: str = "Efectivo",
+    recargo_pct: float = 0.0,
 ) -> tuple[float, int]:
     if cantidad <= 0:
         raise ValueError("La cantidad debe ser mayor a cero.")
@@ -770,7 +842,7 @@ def register_sale(
                 f"Stock insuficiente. Stock actual: {product['stock']}, venta: {cantidad}."
             )
 
-        total = float(product["precio"]) * cantidad
+        total = round(float(product["precio"]) * cantidad * (1 + recargo_pct / 100), 2)
         conn.execute("UPDATE productos SET stock = ? WHERE codigo = ?", (new_stock, codigo.strip()))
         conn.execute(
             """
@@ -783,11 +855,12 @@ def register_sale(
         cursor = conn.execute(
             """
             INSERT INTO ventas
-                (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (codigo, nombre, cantidad, precio_unit, total, fecha, hora, forma_pago, precio_costo, recargo_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (codigo.strip(), product["nombre"], cantidad, float(product["precio"]),
-             total, sale_day, sale_hour, forma_pago, float(product["precio_costo"])),
+             total, sale_day, sale_hour, forma_pago, float(product["precio_costo"]),
+             recargo_pct),
         )
         sale_id = cursor.lastrowid
         if sale_id is None:
@@ -1193,6 +1266,222 @@ def re_apply_prices(conn: sqlite3.Connection, changes: list[tuple[str, float, fl
             )
 
 
+# ── Módulo Morosos ────────────────────────────────────────────────────────────
+
+def add_cliente_moroso(conn: sqlite3.Connection, nombre: str) -> int:
+    """Crea el cliente si no existe y devuelve su id."""
+    nombre = nombre.strip()
+    if not nombre:
+        raise StockError("El nombre del cliente no puede estar vacio.")
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO clientes_morosos (nombre) VALUES (?)", (nombre,)
+        )
+    row = conn.execute(
+        "SELECT id FROM clientes_morosos WHERE nombre = ?", (nombre,)
+    ).fetchone()
+    return int(row["id"])
+
+
+def get_clientes_morosos(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT cm.id, cm.nombre,
+               COUNT(d.id)                    AS deudas_activas,
+               COALESCE(SUM(d.saldo_actual), 0) AS total_adeudado
+        FROM clientes_morosos cm
+        LEFT JOIN deudas d ON d.cliente_id = cm.id AND d.estado = 'activa'
+        GROUP BY cm.id
+        ORDER BY cm.nombre
+        """
+    ).fetchall()
+
+
+def add_deuda(
+    conn: sqlite3.Connection,
+    cliente_id: int,
+    items: list[dict],
+    fecha: date,
+) -> int:
+    """Registra una deuda y descuenta stock. No crea filas en ventas ni caja."""
+    if not items:
+        raise StockError("La deuda debe tener al menos un producto.")
+    monto_original = round(
+        sum(float(i["cantidad"]) * float(i["precio_unit"]) for i in items), 2
+    )
+    with conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO deudas (cliente_id, fecha_registro, monto_original, saldo_actual)
+            VALUES (?, ?, ?, ?)
+            """,
+            (cliente_id, fecha.isoformat(), monto_original, monto_original),
+        )
+        deuda_id = cursor.lastrowid
+        if deuda_id is None:
+            raise StockError("No se pudo registrar la deuda.")
+        for item in items:
+            conn.execute(
+                """
+                INSERT INTO deuda_productos (deuda_id, codigo, nombre, cantidad, precio_unit)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (deuda_id, item["codigo"], item["nombre"],
+                 int(item["cantidad"]), float(item["precio_unit"])),
+            )
+            conn.execute(
+                "UPDATE productos SET stock = stock - ? WHERE codigo = ?",
+                (int(item["cantidad"]), item["codigo"]),
+            )
+    return int(deuda_id)
+
+
+def get_deudas_cliente(
+    conn: sqlite3.Connection, cliente_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT d.*,
+               (SELECT COALESCE(SUM(p.monto_pagado), 0)
+                FROM pagos_deuda p WHERE p.deuda_id = d.id)    AS total_pagado,
+               (SELECT COALESCE(SUM(r.monto_recargo), 0)
+                FROM recargos_deuda r WHERE r.deuda_id = d.id) AS total_recargos
+        FROM deudas d
+        WHERE d.cliente_id = ?
+        ORDER BY d.estado ASC, d.fecha_registro DESC
+        """,
+        (cliente_id,),
+    ).fetchall()
+
+
+def get_deuda_productos(
+    conn: sqlite3.Connection, deuda_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM deuda_productos WHERE deuda_id = ? ORDER BY id",
+        (deuda_id,),
+    ).fetchall()
+
+
+def get_deuda_historial(
+    conn: sqlite3.Connection, deuda_id: int
+) -> list[dict]:
+    """Devuelve pagos y recargos mezclados ordenados por fecha."""
+    pagos = conn.execute(
+        "SELECT fecha_pago AS fecha, 'pago' AS tipo, monto_pagado AS monto, 0 AS porcentaje"
+        " FROM pagos_deuda WHERE deuda_id = ?",
+        (deuda_id,),
+    ).fetchall()
+    recargos = conn.execute(
+        "SELECT fecha_aplicacion AS fecha, 'recargo' AS tipo, monto_recargo AS monto, porcentaje"
+        " FROM recargos_deuda WHERE deuda_id = ?",
+        (deuda_id,),
+    ).fetchall()
+    events = [dict(r) for r in pagos] + [dict(r) for r in recargos]
+    events.sort(key=lambda e: e["fecha"])
+    return events
+
+
+def registrar_pago(
+    conn: sqlite3.Connection, deuda_id: int, monto: float
+) -> float:
+    """Descuenta monto del saldo. Marca saldada si queda en 0. Devuelve nuevo saldo."""
+    deuda = conn.execute(
+        "SELECT saldo_actual, estado FROM deudas WHERE id = ?", (deuda_id,)
+    ).fetchone()
+    if deuda is None:
+        raise StockError("Deuda no encontrada.")
+    if deuda["estado"] == "saldada":
+        raise StockError("La deuda ya esta saldada.")
+    if monto <= 0:
+        raise StockError("El monto del pago debe ser mayor a cero.")
+    if monto > float(deuda["saldo_actual"]):
+        raise StockError(
+            f"El monto (${monto:.2f}) supera el saldo actual (${deuda['saldo_actual']:.2f})."
+        )
+    nuevo_saldo = round(float(deuda["saldo_actual"]) - monto, 2)
+    nuevo_estado = "saldada" if nuevo_saldo == 0 else "activa"
+    with conn:
+        conn.execute(
+            "INSERT INTO pagos_deuda (deuda_id, fecha_pago, monto_pagado) VALUES (?, ?, ?)",
+            (deuda_id, date.today().isoformat(), round(monto, 2)),
+        )
+        conn.execute(
+            "UPDATE deudas SET saldo_actual = ?, estado = ? WHERE id = ?",
+            (nuevo_saldo, nuevo_estado, deuda_id),
+        )
+    return nuevo_saldo
+
+
+def saldar_deuda(conn: sqlite3.Connection, deuda_id: int) -> None:
+    deuda = conn.execute(
+        "SELECT saldo_actual FROM deudas WHERE id = ? AND estado = 'activa'", (deuda_id,)
+    ).fetchone()
+    if deuda is None:
+        raise StockError("Deuda no encontrada o ya saldada.")
+    registrar_pago(conn, deuda_id, float(deuda["saldo_actual"]))
+
+
+def aplicar_recargo(
+    conn: sqlite3.Connection,
+    deuda_id: int,
+    porcentaje: float,
+    fecha_corte: str,
+) -> bool:
+    """Aplica recargo si no fue aplicado ya este corte. Devuelve True si se aplicó."""
+    ya_aplicado = conn.execute(
+        "SELECT 1 FROM recargos_deuda WHERE deuda_id = ? AND fecha_aplicacion = ?",
+        (deuda_id, fecha_corte),
+    ).fetchone()
+    if ya_aplicado:
+        return False
+    deuda = conn.execute(
+        "SELECT saldo_actual FROM deudas WHERE id = ? AND estado = 'activa'", (deuda_id,)
+    ).fetchone()
+    if deuda is None:
+        return False
+    monto_recargo = round(float(deuda["saldo_actual"]) * porcentaje / 100, 2)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO recargos_deuda (deuda_id, fecha_aplicacion, porcentaje, monto_recargo)
+            VALUES (?, ?, ?, ?)
+            """,
+            (deuda_id, fecha_corte, porcentaje, monto_recargo),
+        )
+        conn.execute(
+            "UPDATE deudas SET saldo_actual = saldo_actual + ? WHERE id = ?",
+            (monto_recargo, deuda_id),
+        )
+    return True
+
+
+def aplicar_recargos_mensuales(conn: sqlite3.Connection) -> int:
+    """Aplica recargo del día 10 a todas las deudas activas que califican.
+    Retorna cantidad de deudas cargadas. Es idempotente."""
+    hoy = date.today()
+    if hoy.day != 10:
+        return 0
+    fecha_corte = hoy.isoformat()
+    deudas = conn.execute(
+        """
+        SELECT id FROM deudas
+        WHERE estado = 'activa'
+          AND fecha_registro < ?
+          AND NOT EXISTS (
+              SELECT 1 FROM recargos_deuda
+              WHERE deuda_id = deudas.id AND fecha_aplicacion = ?
+          )
+        """,
+        (fecha_corte, fecha_corte),
+    ).fetchall()
+    count = 0
+    for deuda in deudas:
+        if aplicar_recargo(conn, deuda["id"], _RECARGO_MORA_PCT, fecha_corte):
+            count += 1
+    return count
+
+
 # Service facade
 class StockService:
     """Fachada de operaciones de negocio sobre una conexion SQLite."""
@@ -1278,21 +1567,6 @@ class StockService:
     def quitar_proveedor_producto(self, supplier_id: int) -> None:
         remove_product_supplier(self._conn, supplier_id)
 
-    def vender(
-        self,
-        codigo: str,
-        cantidad: int,
-        forma_pago: str,
-        allow_negative: bool = False,
-        sale_date: date | None = None,
-    ) -> tuple[float, int]:
-        return register_sale(
-            self._conn, codigo, cantidad,
-            allow_negative=allow_negative,
-            sale_date=sale_date,
-            forma_pago=forma_pago,
-        )
-
     def obtener_venta(self, sale_id: int) -> sqlite3.Row:
         return get_sale(self._conn, sale_id)
 
@@ -1372,6 +1646,54 @@ class StockService:
 
     def aplicar_lote_boleta(self, rows: list) -> tuple[int, list[str]]:
         return apply_boleta_batch(self._conn, rows)
+
+    # ── Morosos ──────────────────────────────────────────────────────────────
+
+    def agregar_cliente_moroso(self, nombre: str) -> int:
+        return add_cliente_moroso(self._conn, nombre)
+
+    def listar_clientes_morosos(self) -> list[sqlite3.Row]:
+        return get_clientes_morosos(self._conn)
+
+    def registrar_deuda(
+        self, cliente_id: int, items: list[dict], fecha: date
+    ) -> int:
+        return add_deuda(self._conn, cliente_id, items, fecha)
+
+    def deudas_cliente(self, cliente_id: int) -> list[sqlite3.Row]:
+        return get_deudas_cliente(self._conn, cliente_id)
+
+    def productos_deuda(self, deuda_id: int) -> list[sqlite3.Row]:
+        return get_deuda_productos(self._conn, deuda_id)
+
+    def historial_deuda(self, deuda_id: int) -> list[dict]:
+        return get_deuda_historial(self._conn, deuda_id)
+
+    def pagar_deuda(self, deuda_id: int, monto: float) -> float:
+        return registrar_pago(self._conn, deuda_id, monto)
+
+    def saldar_deuda(self, deuda_id: int) -> None:
+        saldar_deuda(self._conn, deuda_id)
+
+    def aplicar_recargos_mensuales(self) -> int:
+        return aplicar_recargos_mensuales(self._conn)
+
+    def vender(
+        self,
+        codigo: str,
+        cantidad: int,
+        forma_pago: str,
+        allow_negative: bool = False,
+        sale_date: date | None = None,
+        recargo_pct: float = 0.0,
+    ) -> tuple[float, int]:
+        return register_sale(
+            self._conn, codigo, cantidad,
+            allow_negative=allow_negative,
+            sale_date=sale_date,
+            forma_pago=forma_pago,
+            recargo_pct=recargo_pct,
+        )
 
     @staticmethod
     def backup() -> None:
