@@ -6,11 +6,19 @@ import json
 import logging
 import shutil
 import sqlite3
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
 
-BASE_DIR = Path(__file__).resolve().parent
+# In a PyInstaller one-file build __file__ points inside the temp extraction
+# dir (_MEIPASS) which is deleted on exit.  Use the exe path instead so that
+# stock.db and config.json live next to the executable.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
 DB_PATH = BASE_DIR / "stock.db"
 CONFIG_PATH = BASE_DIR / "config.json"
 
