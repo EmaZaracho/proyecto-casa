@@ -640,7 +640,7 @@ class StockGui(tk.Tk):
             row=1, column=6, sticky="ew", padx=(0, 4)
         )
         self._proveedor_combo = ttk.Combobox(
-            self._product_form_frame, textvariable=self.proveedor_var, state="readonly"
+            self._product_form_frame, textvariable=self.proveedor_var
         )
         self._proveedor_combo.grid(row=1, column=7, sticky="ew")
         self._proveedor_combo.bind("<ButtonPress>", lambda _: self._refresh_form_proveedor())
@@ -2617,7 +2617,7 @@ class StockGui(tk.Tk):
         self._product_form_frame.configure(text="Editar producto")
         self._cancel_edit_btn.grid()
         self._refresh_product_suppliers()
-        self._notebook.select(0)
+        self._notebook.select(1)
 
     def cancel_edit(self) -> None:
         self._edit_mode = False
@@ -2629,7 +2629,7 @@ class StockGui(tk.Tk):
         self._cancel_edit_btn.grid_remove()
 
     def _start_add_product_with_code(self, codigo: str) -> None:
-        self._notebook.select(0)
+        self._notebook.select(1)
         if self._edit_mode:
             self.cancel_edit()
         if not self._form_visible:
