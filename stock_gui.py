@@ -61,6 +61,13 @@ class Tooltip:
 
 
 _HELP_TEXTS: dict[str, str] = {
+    "dashboard": (
+        "RESUMEN\n\n"
+        "Vista rápida del estado del negocio.\n\n"
+        "Muestra las ventas de hoy, el total en caja, los productos\n"
+        "con stock crítico y el desglose por forma de pago.\n\n"
+        "Para más detalle, usá las pestañas específicas."
+    ),
     "principal": (
         "PESTAÑA PRINCIPAL\n\n"
         "Tabla de productos\n"
@@ -508,10 +515,15 @@ class StockGui(tk.Tk):
     # Help system
     # =========================================================================
 
+    _TAB_KEYS = ["dashboard", "principal", "precios", "ventas", "historial", "reportes", "morosos"]
+
+    def _show_current_tab_help(self) -> None:
+        idx = self._notebook.index("current")
+        key = self._TAB_KEYS[idx] if idx < len(self._TAB_KEYS) else "principal"
+        self._show_tab_help(key)
+
     def _add_help_button(self, parent: ttk.Frame, tab_key: str) -> None:
-        btn = ttk.Button(parent, text=" ? ", width=3,
-                         command=lambda: self._show_tab_help(tab_key))
-        btn.place(relx=1.0, x=-4, y=4, anchor="ne")
+        pass  # botón ? centralizado en el header — ver _show_current_tab_help
 
     def _show_tab_help(self, tab_key: str) -> None:
         text = _HELP_TEXTS.get(tab_key, "Sin ayuda disponible.")
@@ -576,6 +588,9 @@ class StockGui(tk.Tk):
             command=self._toggle_dark_mode,
         )
         self._dark_mode_btn.grid(row=0, column=5, padx=(6, 0))
+        ttk.Button(hdr, text=" ? ", width=3, command=self._show_current_tab_help).grid(
+            row=0, column=6, padx=(6, 0)
+        )
 
         # shortcuts hint
         _shortcuts_lbl = ttk.Label(hdr, text="F1=Venta  F2=Producto  F3=Pendiente",
