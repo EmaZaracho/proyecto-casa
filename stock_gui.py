@@ -27,6 +27,126 @@ def _calcular_recargo(forma_pago: str, subtotal: float) -> float:
         return round(subtotal * _RECARGO_TARJETA_PCT / 100, 2)
     return 0.0
 
+
+class Tooltip:
+    """Muestra un texto flotante al pasar el cursor sobre un widget."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self._widget = widget
+        self._text = text
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, event: tk.Event) -> None:
+        if self._tip:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self._tip, text=self._text, justify="left",
+            background="#ffffe0", foreground="#000000",
+            relief="solid", borderwidth=1,
+            font=("Segoe UI", 9), wraplength=300, padx=6, pady=4,
+        ).pack()
+
+    def _hide(self, event: tk.Event | None = None) -> None:
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
+_HELP_TEXTS: dict[str, str] = {
+    "principal": (
+        "PESTAÑA PRINCIPAL\n\n"
+        "Tabla de productos\n"
+        "Muestra el catálogo completo. Buscá por código, nombre o proveedor.\n"
+        "Doble clic en una fila para editarla.\n\n"
+        "Colores:\n"
+        "  • Rojo → stock en 0 o negativo\n"
+        "  • Amarillo → stock por debajo del mínimo\n\n"
+        "Formulario de producto\n"
+        "Aparece al hacer '+ Nuevo producto' o al editar una fila.\n"
+        "  • Código: identificador único (ej: código de barras). No se puede\n"
+        "    cambiar después de creado.\n"
+        "  • Precio de costo: lo que pagás al proveedor.\n"
+        "  • Stock mínimo: nivel de alerta. Si el stock baja de este número,\n"
+        "    el producto se resalta.\n\n"
+        "Venta / Carrito\n"
+        "Escribí el código y presioná Enter para agregar al carrito.\n"
+        "  • Efectivo / Transferencia: sin recargo.\n"
+        "  • Tarjeta: aplica 15% de recargo automáticamente.\n"
+        "  • Fiado: descuenta stock pero registra una deuda (sin pago en caja).\n\n"
+        "Atajos: F1 = foco en código de venta  |  F2 = formulario de producto"
+    ),
+    "precios": (
+        "GESTIÓN DE PRECIOS\n\n"
+        "Muestra todos los productos con precio de venta, costo y margen.\n\n"
+        "Margen\n"
+        "(precio de venta − costo) / precio de venta × 100\n"
+        "Ejemplo: comprás a $80 y vendés a $100 → margen = 20%.\n\n"
+        "Filtros\n"
+        "Podés combinar búsqueda de texto con filtro por proveedor.\n\n"
+        "Aumento masivo\n"
+        "1. Filtrá los productos que querés aumentar.\n"
+        "2. Ingresá el porcentaje (ej: 10).\n"
+        "3. 'Aplicar a seleccionados' o 'Aplicar a todos los filtrados'.\n"
+        "El precio resultante se redondea a la decena más cercana.\n"
+        "Todos los cambios quedan registrados en el Historial de precios."
+    ),
+    "ventas": (
+        "VENTAS DEL DÍA\n\n"
+        "Navegá entre fechas con los botones < > o escribí la fecha manualmente.\n"
+        "El botón 'Hoy' vuelve a la fecha de hoy.\n\n"
+        "Rango de fechas\n"
+        "Para ver varios días: completá 'Desde' y 'Hasta' y hacé clic en 'Filtrar'.\n\n"
+        "Cierre de caja\n"
+        "Muestra para el día o rango seleccionado:\n"
+        "  • Total recaudado y cantidad de transacciones.\n"
+        "  • Desglose por forma de pago.\n"
+        "  • Ganancia bruta (precio de venta − costo de los productos vendidos).\n"
+        "  • Top 5 productos más vendidos.\n\n"
+        "Exportar CSV guarda la tabla de ventas visible en un archivo de texto."
+    ),
+    "historial": (
+        "HISTORIAL DE PRECIOS\n\n"
+        "Registro automático de todos los cambios de precio del catálogo.\n\n"
+        "Se registra en:\n"
+        "  • Edición manual de un producto (motivo: 'Edición manual').\n"
+        "  • Aumentos masivos (motivo: 'Aumento masivo X%').\n\n"
+        "Buscá por código o nombre del producto para filtrar el historial."
+    ),
+    "morosos": (
+        "CLIENTES MOROSOS (FIADO)\n\n"
+        "Registrá ventas que el cliente pagará después.\n\n"
+        "Cómo fijar un fiado\n"
+        "1. Agregá productos al carrito normalmente.\n"
+        "2. Elegí forma de pago 'Fiado'.\n"
+        "3. Al cobrar, se te pedirá el nombre del cliente.\n"
+        "El stock se descuenta, pero no se suma a la caja del día.\n\n"
+        "Pagos parciales\n"
+        "Desde esta pestaña podés seleccionar un cliente y registrar\n"
+        "pagos parciales o totales contra cada deuda activa.\n\n"
+        "Recargo por mora\n"
+        "El día 10 de cada mes se aplica automáticamente un 20% sobre\n"
+        "los saldos activos. Queda registrado en el historial de cada deuda."
+    ),
+    "reportes": (
+        "REPORTES\n\n"
+        "Generá un PDF personalizado eligiendo qué secciones incluir:\n\n"
+        "  • Todos los productos: catálogo completo con precios, costo y stock.\n"
+        "  • Ventas: elegís el rango de fechas; incluye resumen financiero,\n"
+        "    desglose por forma de pago y top 5 productos más vendidos.\n"
+        "  • Pendientes: lista de tareas con estado y fecha de creación.\n"
+        "  • Stock bajo: productos que necesitan reposición.\n\n"
+        "El PDF se guarda en la ubicación que indiques al hacer clic en 'Generar PDF'."
+    ),
+}
+
 _COLORS_LIGHT = dict(
     bg="#f0f0f0", bg_widget="#ffffff", fg="#000000", fg_muted="gray",
     btn_bg="#e1e1e1", sel_bg="#0078d7", sel_fg="#ffffff",
@@ -385,6 +505,38 @@ class StockGui(tk.Tk):
         self._rep_hasta_var = tk.StringVar(value=_date_to_ui(date.today()))
 
     # =========================================================================
+    # Help system
+    # =========================================================================
+
+    def _add_help_button(self, parent: ttk.Frame, tab_key: str) -> None:
+        btn = ttk.Button(parent, text=" ? ", width=3,
+                         command=lambda: self._show_tab_help(tab_key))
+        btn.place(relx=1.0, x=-4, y=4, anchor="ne")
+
+    def _show_tab_help(self, tab_key: str) -> None:
+        text = _HELP_TEXTS.get(tab_key, "Sin ayuda disponible.")
+        dlg = tk.Toplevel(self)
+        dlg.title("Ayuda")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+        txt = tk.Text(
+            frame, wrap="word", width=52, height=20,
+            relief="flat", font=("Segoe UI", 10),
+            state="normal", cursor="arrow",
+            padx=4, pady=4,
+        )
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        txt.pack(pady=(0, 12))
+        ttk.Button(frame, text="Cerrar", command=dlg.destroy).pack()
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    # =========================================================================
     # Layout
     # =========================================================================
 
@@ -606,6 +758,7 @@ class StockGui(tk.Tk):
         self._toggle_cart_mode()  # arranca en modo carrito (activo por defecto)
         self._build_alerts_box(right)
         self._build_pending_box(right)
+        self._add_help_button(parent, "principal")
 
     def _build_product_form(self, parent: ttk.Frame) -> None:
         self._product_form_frame = ttk.LabelFrame(parent, text="Alta de producto", padding=8)
@@ -623,38 +776,53 @@ class StockGui(tk.Tk):
         # row 1 â€" entries
         self._codigo_entry = ttk.Entry(self._product_form_frame, textvariable=self.codigo_var)
         self._codigo_entry.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        Tooltip(self._codigo_entry,
+                "Identificador único del producto (ej: código de barras).\n"
+                "No se puede cambiar una vez creado el producto.")
 
         self._nombre_entry = ttk.Entry(self._product_form_frame, textvariable=self.nombre_var)
         self._nombre_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 4))
+        Tooltip(self._nombre_entry, "Nombre del producto tal como aparece en el catálogo y en las ventas.")
 
-        ttk.Entry(self._product_form_frame, textvariable=self.precio_var).grid(
-            row=1, column=3, sticky="ew", padx=(0, 4)
-        )
-        ttk.Entry(self._product_form_frame, textvariable=self.precio_costo_var).grid(
-            row=1, column=4, sticky="ew", padx=(0, 4)
-        )
-        ttk.Entry(self._product_form_frame, textvariable=self.stock_var).grid(
-            row=1, column=5, sticky="ew", padx=(0, 4)
-        )
-        ttk.Entry(self._product_form_frame, textvariable=self.stock_minimo_var).grid(
-            row=1, column=6, sticky="ew", padx=(0, 4)
-        )
+        _precio_entry = ttk.Entry(self._product_form_frame, textvariable=self.precio_var)
+        _precio_entry.grid(row=1, column=3, sticky="ew", padx=(0, 4))
+        Tooltip(_precio_entry, "Precio de venta al cliente.")
+
+        _costo_entry = ttk.Entry(self._product_form_frame, textvariable=self.precio_costo_var)
+        _costo_entry.grid(row=1, column=4, sticky="ew", padx=(0, 4))
+        Tooltip(_costo_entry,
+                "Precio que pagás al proveedor.\n"
+                "Se usa para calcular el margen de ganancia.")
+
+        _stock_entry = ttk.Entry(self._product_form_frame, textvariable=self.stock_var)
+        _stock_entry.grid(row=1, column=5, sticky="ew", padx=(0, 4))
+        Tooltip(_stock_entry, "Cantidad actual en inventario.")
+
+        _minimo_entry = ttk.Entry(self._product_form_frame, textvariable=self.stock_minimo_var)
+        _minimo_entry.grid(row=1, column=6, sticky="ew", padx=(0, 4))
+        Tooltip(_minimo_entry,
+                "Nivel mínimo de alerta.\n"
+                "Si el stock baja de este número, el producto se resalta en amarillo.")
+
         self._proveedor_combo = ttk.Combobox(
             self._product_form_frame, textvariable=self.proveedor_var
         )
         self._proveedor_combo.grid(row=1, column=7, sticky="ew")
         self._proveedor_combo.bind("<ButtonPress>", lambda _: self._refresh_form_proveedor())
         self._proveedor_combo.bind("<FocusIn>", lambda _: self._refresh_form_proveedor())
+        Tooltip(self._proveedor_combo,
+                "Proveedor principal del producto.\n"
+                "Podés agregar múltiples proveedores con la tabla de abajo.")
 
         # row 2 â€" second row labels
         ttk.Label(self._product_form_frame, text="Notas").grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
 
-        # row 3 â€" notas + actions
-        ttk.Entry(self._product_form_frame, textvariable=self.notas_var).grid(
-            row=3, column=0, columnspan=6, sticky="ew", padx=(0, 4)
-        )
+        # row 3 — notas + actions
+        _notas_entry = ttk.Entry(self._product_form_frame, textvariable=self.notas_var)
+        _notas_entry.grid(row=3, column=0, columnspan=6, sticky="ew", padx=(0, 4))
+        Tooltip(_notas_entry, "Observaciones del producto (descripción, lote, etc.). Opcional.")
         self._save_btn = ttk.Button(
             self._product_form_frame, text="Guardar", command=self.save_product
         )
@@ -748,15 +916,17 @@ class StockGui(tk.Tk):
         actions = ttk.Frame(frame)
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         actions.columnconfigure(4, weight=1)
-        ttk.Button(actions, text="Agregar al carrito", command=self.add_selected_to_cart).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        ttk.Button(actions, text="Cargar para editar", command=self.load_selected_for_edit).grid(
-            row=0, column=1, padx=(0, 6)
-        )
-        ttk.Button(actions, text="Ajustar stock", command=self._show_ajuste_stock).grid(
-            row=0, column=2, padx=(0, 6)
-        )
+        _btn_carrito = ttk.Button(actions, text="Agregar al carrito", command=self.add_selected_to_cart)
+        _btn_carrito.grid(row=0, column=0, padx=(0, 6))
+        Tooltip(_btn_carrito, "Agrega el producto seleccionado al carrito de venta.")
+        _btn_editar = ttk.Button(actions, text="Cargar para editar", command=self.load_selected_for_edit)
+        _btn_editar.grid(row=0, column=1, padx=(0, 6))
+        Tooltip(_btn_editar, "Carga el producto en el formulario para modificarlo. También podés hacer doble clic.")
+        _btn_ajuste = ttk.Button(actions, text="Ajustar stock", command=self._show_ajuste_stock)
+        _btn_ajuste.grid(row=0, column=2, padx=(0, 6))
+        Tooltip(_btn_ajuste,
+                "Corrige el stock real sin registrar una venta.\n"
+                "Útil al hacer inventario físico.")
         ttk.Button(actions, text="Eliminar", command=self.delete_selected_product).grid(
             row=0, column=3, padx=(0, 6)
         )
@@ -781,6 +951,9 @@ class StockGui(tk.Tk):
         code_row.columnconfigure(0, weight=1)
         self._venta_codigo_entry = ttk.Entry(code_row, textvariable=self.venta_codigo_var)
         self._venta_codigo_entry.grid(row=0, column=0, sticky="ew")
+        Tooltip(self._venta_codigo_entry,
+                "Escribí el código del producto y presioná Enter.\n"
+                "O usá el botón Buscar para buscar por nombre.")
         ttk.Button(code_row, text="Buscar", width=7, command=self._buscar_producto_por_nombre).grid(
             row=0, column=1, padx=(4, 0)
         )
@@ -797,13 +970,19 @@ class StockGui(tk.Tk):
         ttk.Label(frame, text="Cantidad").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
         self._venta_cantidad_entry = ttk.Entry(frame, textvariable=self.venta_cantidad_var)
         self._venta_cantidad_entry.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        Tooltip(self._venta_cantidad_entry, "Cantidad de unidades a vender (por defecto 1).")
 
         # row 3: forma de pago
         ttk.Label(frame, text="Pago").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
-        ttk.Combobox(
+        _pago_combo = ttk.Combobox(
             frame, textvariable=self._venta_forma_pago_var,
             values=_FORMAS_PAGO, state="readonly", width=14,
-        ).grid(row=3, column=1, sticky="w", pady=(4, 0))
+        )
+        _pago_combo.grid(row=3, column=1, sticky="w", pady=(4, 0))
+        Tooltip(_pago_combo,
+                "Efectivo / Transferencia: sin recargo.\n"
+                "Tarjeta de crédito / débito: se aplica 15% de recargo.\n"
+                "Fiado: descuenta stock pero registra una deuda (sin pago en caja).")
 
         # row 4: normal mode register button
         self._registrar_btn = ttk.Button(
@@ -1001,6 +1180,7 @@ class StockGui(tk.Tk):
             command=self._export_products_csv,
         ).grid(row=0, column=5, padx=(0, 8))
         ttk.Label(inc_frame, textvariable=self._price_status_var).grid(row=0, column=6, sticky="e")
+        self._add_help_button(parent, "precios")
 
     # â"€â"€ Tab 4: price history â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -1040,6 +1220,7 @@ class StockGui(tk.Tk):
         self._hist_table.configure(yscrollcommand=vsb.set)
         self._hist_table.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
+        self._add_help_button(parent, "historial")
 
     def _refresh_price_history(self) -> None:
         clear_table(self._hist_table)
@@ -1144,6 +1325,7 @@ class StockGui(tk.Tk):
         ttk.Button(btn_row, text="Cierre de caja", command=self._show_cierre_caja).grid(
             row=0, column=3
         )
+        self._add_help_button(parent, "ventas")
 
     # =========================================================================
     # Status bar
@@ -2037,6 +2219,7 @@ class StockGui(tk.Tk):
         ttk.Button(btn_row, text="Nuevo cliente", command=self._nuevo_cliente_moroso).pack(
             side="left", padx=(6, 0)
         )
+        self._add_help_button(parent, "morosos")
 
     def refresh_morosos(self) -> None:
         if not hasattr(self, "_morosos_tree"):
@@ -2139,6 +2322,7 @@ class StockGui(tk.Tk):
         ttk.Button(
             btn_row, text="  Generar PDF  ", command=self._generar_reporte_pdf,
         ).pack()
+        self._add_help_button(parent, "reportes")
 
     def _rep_toggle_ventas_dates(self) -> None:
         state = "normal" if self._rep_ventas_var.get() else "disabled"
